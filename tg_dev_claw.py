@@ -216,6 +216,11 @@ def main() -> int:
 
     threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()
 
+    if os.environ.get("NOMAD_REGISTER_HANDLERS", "").strip().lower() in {"1", "true", "yes"}:
+        from claw_runtime.ultimate.nomad import register_nomad_handlers
+
+        register_nomad_handlers(Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)))
+
     # ---- 命令处理器（勿用纯 content_types=text 抢 /start）----
 
     @bot.message_handler(commands=["whoami"])

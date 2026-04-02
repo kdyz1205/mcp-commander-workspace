@@ -1,0 +1,23 @@
+# Example: copy to .github/workflows/nomad-resume.yml and customize.
+# Reads .claw/nomad_snapshot.json from the repo after an auto-push from your machine.
+name: nomad-resume
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".claw/nomad_snapshot.json"
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show snapshot (no secrets)
+        run: |
+          if [ -f .claw/nomad_snapshot.json ]; then
+            cat .claw/nomad_snapshot.json | head -c 8000
+          else
+            echo "No snapshot"
+          fi
+      - name: Placeholder — add your Colab export pull / notify / dry-run strategy here
+        run: echo "Replace this step with your compliant automation."

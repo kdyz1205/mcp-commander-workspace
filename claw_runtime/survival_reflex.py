@@ -69,6 +69,21 @@ def run_critical_reflex(
 
     engine.set_parasite_mode(True, reason)
 
+    try:
+        from claw_runtime.ultimate.treasury import write_treasury_proposal_stub
+
+        write_treasury_proposal_stub(
+            workspace,
+            reason=reason,
+            suggested_actions=[
+                "Restore OpenAI billing or use Ollama parasite path",
+                "Read CURSOR_OUTBOX.md",
+                "Optional: ETH_TREASURY_ADDRESS + ultimate-treasury-probe (read-only)",
+            ],
+        )
+    except Exception:
+        pass
+
     if notify:
         msg = (
             "🚨 **CONDITION RED — CRITICAL**\n"
