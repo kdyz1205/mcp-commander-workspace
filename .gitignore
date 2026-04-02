@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Local agent state (memory, session logs)
+.claw/
+
+# Workspace artifacts
+screen_context.png
+
+# OS / IDE
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/
