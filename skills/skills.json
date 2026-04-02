@@ -51,6 +51,13 @@
       "notes": "与 dev_claw --autonomous 同源；不自动 Selenium/代充。"
     },
     {
+      "id": "evolution_brain",
+      "title": "进化大脑：推理闭环与合规边界",
+      "path": "skills/evolution_brain/SKILL.md",
+      "invoke": "load_skill evolution_brain",
+      "notes": "task_plan + memory + skill-creator；不自动链上提款/OpenAI 充值。"
+    },
+    {
       "id": "proxy_rotator",
       "title": "自备代理/VPN 轮换",
       "path": "skills/proxy_rotator/SKILL.md",

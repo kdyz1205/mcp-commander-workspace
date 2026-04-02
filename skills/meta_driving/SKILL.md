@@ -15,6 +15,7 @@ metadata: {"openclaw":{"always":false}}
 |------|------|
 | CRITICAL | `run_critical_reflex`（**OUTBOX+寄生每轮必刷新**；去抖仅 TG/treasury） |
 | DEGRADED + `META_COLAB_ON_DEGRADED=1` | `build_colab_job_bundle`（**手动**上传 Colab，无 Selenium 登录） |
+| DEGRADED 或连续失败 + `META_REASONING_EPISODE=1` | `reasoning_episode.maybe_auto_reasoning_stub` → 追加 `task_plan.md` 推理模板 |
 | 近 1h 有 rate 类错误 + `PROXY_LIST_FILE` | `rotate_proxy_index`（+ 可选 `VPN_SWITCH_CMD`） |
 | 24h 内 `insufficient_quota` | `treasury_proposal` + 可选只读 `trading_funding_binance.py` 子进程 |
 | `META_EVOLVE_ON_TICK=1` | 去抖后 `materialize_draft_skill` |

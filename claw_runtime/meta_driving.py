@@ -83,6 +83,22 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             actions.append({"name": "colab_bundle_error", "detail": str(e)[:500]})
 
+    # 2b) 推理闭环占位：DEGRADED 或连续失败 → task_plan.md 追加假设-验证段（debounced）
+    if _env_bool("META_REASONING_EPISODE", default=False):
+        try:
+            from claw_runtime.reasoning_episode import maybe_auto_reasoning_stub
+
+            rp = maybe_auto_reasoning_stub(ws, state_value=state.value, reason=reason, snapshot=snap)
+            if rp:
+                actions.append({"name": "reasoning_episode", "detail": str(rp)})
+                append_memory(
+                    ws,
+                    "lesson",
+                    f"[meta_tick] Appended reasoning episode to task_plan.md ({state.value}, fails={snap.get('consecutive_failures', 0)}).",
+                )
+        except Exception as e:  # noqa: BLE001
+            actions.append({"name": "reasoning_episode_error", "detail": str(e)[:500]})
+
     # 3) Network pain → rotate proxy from user list (optional VPN_SWITCH_CMD)
     if int(q.get("rate_like_events_1h", 0) or 0) >= 1 and os.environ.get("PROXY_LIST_FILE", "").strip():
         if _env_bool("META_PROXY_ROTATE_ON_NET_PAIN", default=True):
