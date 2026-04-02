@@ -609,9 +609,27 @@ def dev_claw_run(
                         print(warn, file=sys.stderr)
                         _emit(warn)
                     else:
-                        msg = f"[生存状态 CRITICAL] {reason}\n已中止本轮 API 调用（避免浪费额度）。"
+                        reflex_db = float(os.environ.get("DEVCLAW_REFLEX_DEBOUNCE_SEC", "60") or "60")
+                        tg_notify = (lambda t: _emit(t)) if progress_hook else None
+                        run_critical_reflex(
+                            workspace_path,
+                            survival,
+                            debounce_sec=reflex_db,
+                            notify=tg_notify,
+                        )
+                        msg = f"[生存状态 CRITICAL] {reason}\n已停止云端 API，并转入本地自治降级路径。"
                         print(msg, file=sys.stderr)
                         _emit(msg)
+                        if _offline_brain_enabled():
+                            result = run_offline_brain(
+                                workspace_path,
+                                user_instruction,
+                                emit=_emit if progress_hook else None,
+                                failure_reason=reason,
+                            )
+                            _emit("[完成]\n" + result.summary)
+                            exit_success = True
+                            return True
                         return False
 
             if skills_on:

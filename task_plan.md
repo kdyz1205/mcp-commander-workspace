@@ -116,3 +116,67 @@
 若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
 
 ---
+
+
+### 推理片段 [2026-04-02 19:03 UTC] — offline_brain
+
+**假设（Hypothesis）:**  
+用户请求: 学习；当前系统处于 CRITICAL，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**  
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**  
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---
+
+
+### 推理片段 [2026-04-02 19:09 UTC] — offline_brain
+
+**假设（Hypothesis）:**  
+用户请求: 只 并做一轮 production self test 生成自愈脚本 融合 git commit 和 summarize 写 treasury proposal、赚钱计划、nomad snapshot 并汇报离线闭环状态；当前系统处于 CRITICAL，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**  
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**  
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---
+
+
+### 推理片段 [2026-04-02 19:11 UTC] — offline_brain
+
+**假设（Hypothesis）:**  
+用户请求: 【生存维系 · 队列任务】运营资金估算低于阈值（见 .claw/fund_estimate.json 或 SURVIVAL_FUND_BALANCE_USD）。请 load_skill trading，在**人工批准**与合规边界内评估策略；仅允许只读/模拟/已授权操作。严禁自动 OpenAI 代充或无人托管链上出金。；当前系统处于 CRITICAL，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**  
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**  
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---
+
+
+### 推理片段 [2026-04-02 19:11 UTC] — offline_brain
+
+**假设（Hypothesis）:**  
+用户请求: 只 并做一轮 production self test 生成自愈脚本 融合 git commit 和 summarize 写 treasury proposal、赚钱计划、nomad snapshot 并汇报离线闭环状态；当前系统处于 CRITICAL，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**  
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**  
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---

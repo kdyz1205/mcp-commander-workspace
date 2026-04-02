@@ -59,6 +59,7 @@ except ImportError:
 
 from claw_runtime.consciousness_router import route_message
 from claw_runtime.nightly_evolution import append_evolution_failure
+from claw_runtime.operator_bridge import append_operator_reply, pop_operator_messages
 from claw_runtime.runtime_control import (
     allows_autonomous_life,
     allows_idle_autotick,
@@ -218,58 +219,61 @@ def main() -> int:
     ensure_runtime_control(ws_path)
 
     bot = telebot.TeleBot(token, parse_mode=None)
-    task_q: queue.Queue[tuple[int, str]] = queue.Queue()
+    task_q: queue.Queue[tuple[str, int, str, str | None]] = queue.Queue()
     max_iters = int(os.environ.get("TG_DEVCLAW_MAX_ITERS", str(_DEFAULT_ITERS)))
     system_append = os.environ.get("TG_DEVCLAW_SYSTEM_APPEND", "").strip() or None
     worker_busy = threading.Event()
+    run_lock = threading.Lock()
 
     _register_bot_commands(bot)
 
     def worker() -> None:
         while True:
-            chat_id, instruction = task_q.get()
-            worker_busy.set()
-            pause_notice_sent = False
-            while not _control_state().accepting_tasks:
-                if not pause_notice_sent:
-                    try:
-                        _send_chunks(
-                            bot,
+            channel, chat_id, instruction, request_id = task_q.get()
+            with run_lock:
+                worker_busy.set()
+                pause_notice_sent = False
+                while not _control_state().accepting_tasks:
+                    if not pause_notice_sent:
+                        _dispatch_reply(
+                            channel,
                             chat_id,
                             "收到暂停指令，当前任务已挂起，等待你发送“开始干活”或 /resume 再继续。",
+                            request_id=request_id,
+                            kind="status",
                         )
+                        pause_notice_sent = True
+                    time.sleep(2)
+                merged = _merged_system_append(instruction) or system_append
+                try:
+
+                    def hook(msg: str) -> None:
+                        _dispatch_reply(channel, chat_id, msg, request_id=request_id, kind="progress")
+
+                    dev_claw_run(
+                        instruction,
+                        max_iterations=max_iters,
+                        system_append=merged,
+                        progress_hook=hook,
+                    )
+                    if channel == "local":
+                        _dispatch_reply(
+                            channel,
+                            chat_id,
+                            "[operator bridge] 任务执行完成。",
+                            request_id=request_id,
+                            kind="complete",
+                        )
+                except Exception as e:  # noqa: BLE001
+                    try:
+                        append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
                     except Exception:
                         pass
-                    pause_notice_sent = True
-                time.sleep(2)
-            merged = _merged_system_append(instruction) or system_append
-            try:
-
-                def hook(msg: str) -> None:
-                    try:
-                        _send_chunks(bot, chat_id, msg)
-                    except Exception:  # noqa: BLE001
-                        pass
-
-                dev_claw_run(
-                    instruction,
-                    max_iterations=max_iters,
-                    system_append=merged,
-                    progress_hook=hook,
-                )
-            except Exception as e:  # noqa: BLE001
-                try:
-                    append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
-                except Exception:
-                    pass
-                err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
-                try:
-                    _send_chunks(bot, chat_id, err)
-                except Exception:
-                    pass
-            finally:
-                worker_busy.clear()
-                task_q.task_done()
+                    err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
+                    _dispatch_reply(channel, chat_id, err, request_id=request_id, kind="error")
+                finally:
+                    worker_busy.clear()
+                    task_q.task_done()
 
     threading.Thread(target=worker, daemon=True, name="devclaw-worker").start()
 
@@ -280,6 +284,23 @@ def main() -> int:
             except Exception:
                 pass
 
+    def _send_local_reply(request_id: str | None, chat_id: int, text: str, *, kind: str = "reply") -> None:
+        if not request_id:
+            return
+        append_operator_reply(
+            ws_path,
+            request_id=request_id,
+            chat_id=chat_id,
+            text=text,
+            kind=kind,
+        )
+
+    def _dispatch_reply(channel: str, chat_id: int, text: str, *, request_id: str | None = None, kind: str = "reply") -> None:
+        if channel == "local":
+            _send_local_reply(request_id, chat_id, text, kind=kind)
+            return
+        _send_chunks(bot, chat_id, text)
+
     def _control_state():
         return load_runtime_control(ws_path)
 
@@ -288,6 +309,35 @@ def main() -> int:
             panel_summary(_control_state())
             + "\n- 说明: 自然语言可直接说“开始干活”“暂停”“只模拟交易”“控制面板”。"
         )
+
+    def _handle_text_input(
+        chat_id: int,
+        text: str,
+        *,
+        actor: str,
+        channel: str,
+        request_id: str | None = None,
+    ) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        control_outcome = interpret_control_message(ws_path, text, actor=actor)
+        if control_outcome is not None:
+            _dispatch_reply(channel, chat_id, control_outcome.reply, request_id=request_id)
+            if control_outcome.queue_instruction:
+                task_q.put((channel, chat_id, control_outcome.queue_instruction, request_id))
+            return
+        control = _control_state()
+        if not control.accepting_tasks:
+            _dispatch_reply(
+                channel,
+                chat_id,
+                "当前处于暂停/静默状态，暂不接新任务。发送“开始干活”或 /resume 可恢复。\n\n" + panel_summary(control),
+                request_id=request_id,
+            )
+            return
+        _dispatch_reply(channel, chat_id, "已入队，DevClaw 开始处理…", request_id=request_id)
+        task_q.put((channel, chat_id, text, request_id))
 
     def survival_heartbeat_loop() -> None:
         """
@@ -325,7 +375,7 @@ def main() -> int:
                         for item in pop_persisted_tasks(ws_path, max_n=1):
                             t = (item.get("text") or "").strip()
                             if t:
-                                task_q.put((primary_chat_hb, t))
+                                task_q.put(("tg", primary_chat_hb, t, None))
                     except Exception:
                         pass
                 st, _reason = eng.assess_survival_state()
@@ -341,6 +391,38 @@ def main() -> int:
             time.sleep(max(15, tick))
 
     threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()
+
+    def local_operator_loop() -> None:
+        while True:
+            try:
+                for item in pop_operator_messages(ws_path, max_n=5):
+                    text = str(item.get("text") or "").strip()
+                    if not text:
+                        continue
+                    request_id = str(item.get("id") or f"req-{time.time_ns()}")
+                    try:
+                        chat_id = int(item.get("chat_id") or 0)
+                    except (TypeError, ValueError):
+                        chat_id = 0
+                    actor = f"local:{item.get('source') or 'bridge'}"
+                    _handle_text_input(
+                        chat_id,
+                        text,
+                        actor=actor,
+                        channel="local",
+                        request_id=request_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                append_operator_reply(
+                    ws_path,
+                    request_id=f"bridge-{time.time_ns()}",
+                    chat_id=0,
+                    text=f"[operator bridge exception] {exc!s}",
+                    kind="error",
+                )
+            time.sleep(0.5)
+
+    threading.Thread(target=local_operator_loop, daemon=True, name="operator-bridge").start()
 
     def idle_autotick_loop() -> None:
         """空闲时每 30 分钟（可配置）跑一次轻量自检 DevClaw（与 full autonomous_life 独立）。"""
@@ -769,24 +851,12 @@ def main() -> int:
                 f"无权限。chat_id={message.chat.id} → 写入 TG_ADMIN_CHAT_IDS。",
             )
             return
-        text = (message.text or "").strip()
-        if not text:
-            return
-        control_outcome = interpret_control_message(ws_path, text, actor=f"tg:{message.chat.id}")
-        if control_outcome is not None:
-            bot.reply_to(message, control_outcome.reply)
-            if control_outcome.queue_instruction:
-                task_q.put((message.chat.id, control_outcome.queue_instruction))
-            return
-        control = _control_state()
-        if not control.accepting_tasks:
-            bot.reply_to(
-                message,
-                "当前处于暂停/静默状态，暂不接新任务。发送“开始干活”或 /resume 可恢复。\n\n" + panel_summary(control),
-            )
-            return
-        bot.reply_to(message, "已入队，DevClaw 开始处理…")
-        task_q.put((message.chat.id, text))
+        _handle_text_input(
+            message.chat.id,
+            message.text or "",
+            actor=f"tg:{message.chat.id}",
+            channel="tg",
+        )
 
     @bot.message_handler(content_types=["text"], func=lambda m: m.text is not None and _text_looks_like_command(m.text))
     def on_unknown_command(message: telebot.types.Message) -> None:

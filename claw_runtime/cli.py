@@ -232,6 +232,36 @@ def cmd_production_self_test(args: argparse.Namespace) -> int:
     return 0 if report.get("passed") else 1
 
 
+def cmd_live_operator_self_test(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from claw_runtime.self_test import run_live_operator_self_test
+
+    ws = Path(args.workspace).resolve()
+    report = run_live_operator_self_test(ws, timeout_sec=float(args.timeout))
+    print(_json.dumps(report, indent=2, ensure_ascii=False))
+    return 0 if report.get("passed") else 1
+
+
+def cmd_operator_send(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from claw_runtime.operator_bridge import enqueue_operator_message, wait_for_operator_output
+
+    ws = Path(args.workspace).resolve()
+    text = " ".join(args.text).strip()
+    if not text:
+        print("operator-send requires text", file=sys.stderr)
+        return 1
+    request_id = enqueue_operator_message(ws, text, source="cli")
+    print(_json.dumps({"request_id": request_id}, ensure_ascii=False))
+    if not args.wait:
+        return 0
+    messages = wait_for_operator_output(ws, request_id, min_messages=args.min_messages, timeout_sec=float(args.timeout))
+    print(_json.dumps({"request_id": request_id, "messages": messages}, indent=2, ensure_ascii=False))
+    return 0 if messages else 1
+
+
 def cmd_control_panel(args: argparse.Namespace) -> int:
     from claw_runtime.runtime_control import ensure_runtime_control, panel_summary, runtime_control_path
 
@@ -407,6 +437,17 @@ def main() -> int:
 
     pst = sub.add_parser("production-self-test", help="Run four-dimension production self-test")
     pst.set_defaults(func=cmd_production_self_test)
+
+    lost = sub.add_parser("live-operator-self-test", help="Exercise the running bot through the local operator bridge")
+    lost.add_argument("--timeout", type=float, default=180.0, help="Seconds to wait for the live bot run")
+    lost.set_defaults(func=cmd_live_operator_self_test)
+
+    osend = sub.add_parser("operator-send", help="Send a local operator message to the running bot")
+    osend.add_argument("text", nargs="+", help="Message text")
+    osend.add_argument("--wait", action="store_true", help="Wait for outbox replies")
+    osend.add_argument("--min-messages", type=int, default=1, help="Minimum outbox messages before returning")
+    osend.add_argument("--timeout", type=float, default=30.0, help="Seconds to wait for replies")
+    osend.set_defaults(func=cmd_operator_send)
 
     cpanel = sub.add_parser("control-panel", help="Show runtime control panel state")
     cpanel.set_defaults(func=cmd_control_panel)
