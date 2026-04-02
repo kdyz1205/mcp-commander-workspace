@@ -14,6 +14,7 @@
 | DevClaw 裸循环 | `dev_claw/main.py` | `py dev_claw\main.py --workspace <路径> "任务"` | 通用终端+写文件；含 OpenClaw 式 SKILL 热重载 |
 | OpenClaw 运行时 | `claw_runtime/` + `skills/*/SKILL.md` | `load_skill` / `claw.config.json` | YAML frontmatter、插件 skills、安装/扫描/多 Agent CLI |
 | Claw CLI | `python -m claw_runtime.cli` | `skills-install` / `safety-scan` / `plugins-list` / `multi-agent` | 见 `--workspace` |
+| 生存引擎 Phase1 | `claw_runtime/survival_engine.py` | DevClaw 每轮 `heartbeat` + API 失败 `record_api_error`；`DEVCLAW_SURVIVAL_GATE=0` 可关闭门禁 | 状态 `.claw/survival_state.json`；对齐 claude-tg-bot 的 vital/quota 思路 |
 
 ## 登记规范
 

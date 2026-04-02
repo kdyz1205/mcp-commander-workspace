@@ -30,6 +30,7 @@ from claw_runtime.memory import append_memory
 from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
 from claw_runtime.session_log import log_tool
 from claw_runtime.skill_registry import SkillRegistry
+from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 
 
 def _workspace_root() -> str:
@@ -42,6 +43,20 @@ def _workspace_root() -> str:
 MAX_TOOL_CHARS = 120_000
 TERMINAL_TIMEOUT = int(os.environ.get("DEVCLAW_TERMINAL_TIMEOUT", "120"))
 WEB_FETCH_MAX = int(os.environ.get("DEVCLAW_WEB_FETCH_MAX", "1500000"))
+
+
+def _survival_record_api_error(workspace_path: Path, err: BaseException) -> None:
+    try:
+        se = SurvivalEngine(workspace_path)
+        msg = str(err).lower()
+        code = type(err).__name__
+        if "insufficient_quota" in msg:
+            code = "insufficient_quota"
+        elif "429" in str(err) or "rate limit" in msg:
+            code = "429"
+        se.record_api_error(code, str(err)[:1200])
+    except Exception:
+        pass
 
 
 def execute_terminal(command: str) -> str:
@@ -366,16 +381,36 @@ def dev_claw_run(
         {"role": "user", "content": user_instruction},
     ]
 
+    survival = SurvivalEngine(workspace_path)
+    survival_gate = os.environ.get("DEVCLAW_SURVIVAL_GATE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+    }
+
     for i in range(max_iterations):
+        survival.heartbeat()
+        if survival_gate:
+            state, reason = survival.assess_survival_state()
+            if state == SurvivalState.CRITICAL:
+                msg = f"[生存状态 CRITICAL] {reason}\n已中止本轮 API 调用（避免浪费额度）。"
+                print(msg, file=sys.stderr)
+                _emit(msg)
+                return
+
         if skills_on:
             messages[0]["content"] = base_core + "\n\n" + registry.catalog_text()
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+        except Exception as e:
+            _survival_record_api_error(workspace_path, e)
+            raise
         choice = response.choices[0]
         response_message = choice.message
         messages.append(_assistant_to_dict(response_message))
