@@ -34,7 +34,12 @@ from claw_runtime.quota_tracker import QuotaTracker
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 from claw_runtime.survival_reflex import run_critical_reflex
 from claw_runtime.ultimate.nomad import load_nomad_system_append
-from claw_runtime.ultimate.proxy_env import apply_proxy_env, current_proxy_env
+from claw_runtime.ultimate.proxy_env import (
+    apply_proxy_env,
+    current_proxy_env,
+    restore_proxy_env,
+    snapshot_proxy_env,
+)
 from claw_runtime.ultimate.self_heal import emit_rebuild_venv_scripts
 
 
@@ -251,6 +256,22 @@ def web_fetch(url: str) -> str:
         return f"web_fetch 失败: {e!s}"
 
 
+def _probe_compatible_backend(base_url: str, *, timeout: float = 3.0) -> tuple[bool, str]:
+    probe_url = base_url.rstrip("/") + "/models"
+    req = Request(probe_url, headers={"User-Agent": "DevClaw-parasite-probe/1.0"}, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return True, f"HTTP {getattr(resp, 'status', 200)}"
+    except HTTPError as exc:
+        if exc.code in {401, 403, 404, 405}:
+            return True, f"HTTP {exc.code}"
+        return False, f"HTTPError {exc.code}: {exc.reason}"
+    except URLError as exc:
+        return False, f"URLError: {exc.reason}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc!s}"
+
+
 def use_browser_stub(task_prompt: str) -> str:
     """Placeholder: wire browser-use / Playwright here; in Cursor prefer Web-Browser MCP."""
     return (
@@ -439,11 +460,16 @@ def dev_claw_run(
     workspace_path = Path(ws)
     survival = SurvivalEngine(workspace_path)
     exit_success = False
+    proxy_snapshot = snapshot_proxy_env()
 
     try:
         apply_proxy_env(workspace_path)
         parasite = survival.parasite_active()
+        parasite_base_url: str | None = None
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        cloud_timeout = float(os.environ.get("DEVCLAW_MODEL_TIMEOUT_SEC", "60") or "60")
+        parasite_timeout = float(os.environ.get("DEVCLAW_PARASITE_TIMEOUT_SEC", "12") or "12")
+        request_timeout = parasite_timeout if parasite else cloud_timeout
         if not parasite and not api_key:
             if _offline_brain_enabled():
                 result = run_offline_brain(
@@ -467,6 +493,7 @@ def dev_claw_run(
 
         if parasite:
             base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip()
+            parasite_base_url = base_url
             okey = os.environ.get("OLLAMA_API_KEY", "ollama").strip() or "ollama"
             model = os.environ.get("OLLAMA_MODEL", "llama3.2").strip() or "llama3.2"
             if OpenAI is None:
@@ -482,7 +509,7 @@ def dev_claw_run(
                     return True
                 print("Missing openai package for parasite mode.", file=sys.stderr)
                 return False
-            client = OpenAI(base_url=base_url, api_key=okey)
+            client = OpenAI(base_url=base_url, api_key=okey, timeout=request_timeout)
             quota_platform: str | None = None
         else:
             if OpenAI is None:
@@ -498,7 +525,7 @@ def dev_claw_run(
                     return True
                 print("Missing openai. Run: py -m pip install -r dev_claw/requirements.txt", file=sys.stderr)
                 return False
-            client = OpenAI(api_key=api_key)
+            client = OpenAI(api_key=api_key, timeout=request_timeout)
             model = os.environ.get("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
             quota_platform = "openai"
 
@@ -641,11 +668,27 @@ def dev_claw_run(
                 return False
 
             try:
+                if parasite:
+                    probe_timeout = min(3.0, max(1.0, request_timeout / 2.0))
+                    ok, detail = _probe_compatible_backend(parasite_base_url or "", timeout=probe_timeout)
+                    if not ok and _offline_brain_enabled():
+                        _emit(f"[寄生脑] 本地兼容端点预探测失败（{detail}），直接转离线研究脑。")
+                        result = run_offline_brain(
+                            workspace_path,
+                            user_instruction,
+                            emit=_emit if progress_hook else None,
+                            failure_reason=f"parasite backend probe failure: {detail}",
+                        )
+                        _emit("[完成]\n" + result.summary)
+                        exit_success = True
+                        return True
+                    _emit(f"[寄生脑] 正在连接本地兼容端点；若 {request_timeout:.0f}s 内无响应，将自动转离线研究脑。")
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
+                    timeout=request_timeout,
                 )
             except Exception as e:
                 _survival_record_api_error(workspace_path, e)
@@ -827,6 +870,7 @@ def dev_claw_run(
         return False
 
     finally:
+        restore_proxy_env(proxy_snapshot)
         try:
             survival.record_task_outcome(exit_success)
             if exit_success and os.environ.get("DEVCLAW_TRACK_SOFT_CREDITS", "1").strip().lower() not in {

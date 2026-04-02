@@ -8,6 +8,9 @@ Set-Location $root
 $OutputEncoding = [System.Text.Encoding]::UTF8
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
+@("HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY","http_proxy","https_proxy","all_proxy","no_proxy") | ForEach-Object {
+    Remove-Item -Path "Env:$_" -ErrorAction SilentlyContinue
+}
 
 $envFile = Join-Path $root ".env"
 if (Test-Path $envFile) {

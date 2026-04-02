@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from claw_runtime.memory import append_memory
+from claw_runtime.research_lab import run_public_research_scout
 from claw_runtime.reasoning_episode import append_reasoning_episode
 from claw_runtime.skill_registry import SkillRegistry
 from claw_runtime.survival_engine import SurvivalEngine
@@ -78,6 +79,29 @@ def _should(text: str, *needles: str) -> bool:
     return any(n.lower() in lowered for n in needles)
 
 
+def _research_request(text: str) -> bool:
+    return _should(
+        text,
+        "\u8bba\u6587",
+        "paper",
+        "papers",
+        "research",
+        "arxiv",
+        "\u6df1\u5ea6\u5b66\u4e60",
+        "deep learning",
+        "machine learning",
+        "\u56e0\u5b50",
+        "factor",
+        "\u4ea4\u6613",
+        "\u4ea4\u6613\u7814\u7a76",
+        "\u91cf\u5316",
+        "\u91cf\u5316\u7814\u7a76",
+        "quant",
+        "trading",
+        "alpha",
+    )
+
+
 def run_offline_brain(
     workspace: Path | str,
     user_instruction: str,
@@ -129,6 +153,20 @@ def run_offline_brain(
         rotated = rotate_proxy_index(workspace)
         actions.append({"name": "proxy_rotate", "detail": json.dumps(rotated, ensure_ascii=False)})
         _emit(emit, f"[离线动作] 代理轮换结果: {json.dumps(rotated, ensure_ascii=False)}")
+
+    if _research_request(text):
+        research = run_public_research_scout(workspace, text, emit=emit)
+        actions.append(
+            {
+                "name": "research_scout",
+                "detail": f"{research.markdown_path} ({len(research.papers)} papers, {len(research.factors)} factors)",
+            }
+        )
+        _emit(
+            emit,
+            f"[离线研究] 已输出论文/因子报告: {research.markdown_path.name}；"
+            f"候选因子 {len(research.factors)} 个。",
+        )
 
     proposal = write_treasury_proposal_stub(
         workspace,
@@ -192,4 +230,3 @@ def run_offline_brain(
     lines.extend(f"- {item['name']}: {item['detail']}" for item in actions)
     summary = "\n".join(lines)
     return OfflineBrainResult(summary=summary, actions=actions)
-

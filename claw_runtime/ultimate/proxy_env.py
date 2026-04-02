@@ -12,6 +12,17 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+_PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+
 
 def load_proxy_list(path: Path | str) -> list[str]:
     p = Path(path)
@@ -47,8 +58,28 @@ def current_proxy_env(workspace: Path | str) -> dict[str, str]:
     return {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy}
 
 
+def snapshot_proxy_env() -> dict[str, str]:
+    return {key: value for key in _PROXY_ENV_KEYS if (value := os.environ.get(key)) is not None}
+
+
+def clear_proxy_env() -> None:
+    for key in _PROXY_ENV_KEYS:
+        os.environ.pop(key, None)
+
+
+def restore_proxy_env(snapshot: dict[str, str] | None) -> None:
+    clear_proxy_env()
+    if not snapshot:
+        return
+    for key, value in snapshot.items():
+        os.environ[key] = value
+
+
 def apply_proxy_env(workspace: Path | str) -> dict[str, str]:
     env_map = current_proxy_env(workspace)
+    for key in _PROXY_ENV_KEYS:
+        if key not in env_map:
+            os.environ.pop(key, None)
     for key, value in env_map.items():
         os.environ[key] = value
     return env_map

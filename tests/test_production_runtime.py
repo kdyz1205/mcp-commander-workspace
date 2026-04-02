@@ -38,9 +38,10 @@ class FakeChat:
 
 
 class FakeOpenAI:
-    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None, base_url: str | None = None, timeout: float | None = None) -> None:
         self.api_key = api_key
         self.base_url = base_url
+        self.timeout = timeout
         self.chat = FakeChat(base_url)
 
 
@@ -88,11 +89,11 @@ class ProductionRuntimeTests(unittest.TestCase):
     def test_loopback_runs_offline_brain_without_keys(self) -> None:
         out = run_loopback_instruction(
             self.workspace,
-            "请生成自愈脚本、收益计划、nomad snapshot，并融合 git-commit 和 summarize。",
+            "\u8bf7\u751f\u6210\u81ea\u6108\u811a\u672c\u3001\u6536\u76ca\u8ba1\u5212\u3001nomad snapshot\uff0c\u5e76\u878d\u5408 git-commit \u548c summarize\u3002",
             max_iterations=4,
         )
         self.assertTrue(out.success)
-        self.assertTrue(any("离线降级脑" in msg for msg in out.messages))
+        self.assertTrue(any("\u79bb\u7ebf\u964d\u7ea7\u8111" in msg for msg in out.messages))
         self.assertTrue((self.workspace / ".claw" / "revenue_plan.json").is_file())
         self.assertTrue((self.workspace / ".claw" / "nomad_snapshot.json").is_file())
         self.assertTrue((self.workspace / "skills" / "survival_hybrid" / "SKILL.md").is_file())
@@ -104,14 +105,33 @@ class ProductionRuntimeTests(unittest.TestCase):
 
             messages: list[str] = []
             ok = dev_claw_run(
-                "请在额度耗尽后继续完成自愈和提案。",
+                "\u8bf7\u5728\u989d\u5ea6\u8017\u5c3d\u540e\u7ee7\u7eed\u5b8c\u6210\u81ea\u6108\u548c\u63d0\u6848\u3002",
                 max_iterations=3,
                 progress_hook=messages.append,
             )
         self.assertTrue(ok)
-        self.assertTrue(any("Fallback" in msg or "离线降级脑" in msg for msg in messages))
+        self.assertTrue(any("Fallback" in msg or "\u79bb\u7ebf\u964d\u7ea7\u8111" in msg for msg in messages))
         self.assertTrue((self.workspace / "CURSOR_OUTBOX.md").is_file())
         self.assertTrue((self.workspace / ".claw" / "parasite_mode.json").is_file())
+
+    def test_devclaw_restores_proxy_env_after_run(self) -> None:
+        with patch("dev_claw.main.OpenAI", FakeOpenAI):
+            os.environ["OPENAI_API_KEY"] = "test-key"
+            os.environ["HTTP_PROXY"] = "http://original-proxy:8000"
+            os.environ["HTTPS_PROXY"] = "http://original-proxy:8000"
+            rotate_proxy_index(self.workspace)
+            os.environ["HTTP_PROXY"] = "http://original-proxy:8000"
+            os.environ["HTTPS_PROXY"] = "http://original-proxy:8000"
+            from dev_claw.main import dev_claw_run
+
+            ok = dev_claw_run(
+                "restore proxy env after quota fallback",
+                max_iterations=2,
+                progress_hook=lambda _msg: None,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(os.environ.get("HTTP_PROXY"), "http://original-proxy:8000")
+        self.assertEqual(os.environ.get("HTTPS_PROXY"), "http://original-proxy:8000")
 
     def test_production_self_test_report_passes(self) -> None:
         report = run_production_self_test(self.workspace)

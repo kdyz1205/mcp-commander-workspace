@@ -76,6 +76,53 @@ from dev_claw.main import dev_claw_run
 
 TG_CHUNK = 3800
 _DEFAULT_ITERS = 24
+_TELEGRAM_PROXY_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+_TELEGRAM_HTTP_SESSION = None
+
+
+def _clear_process_proxy_env() -> None:
+    for key in _TELEGRAM_PROXY_KEYS:
+        os.environ.pop(key, None)
+
+
+def _telegram_http_session():
+    global _TELEGRAM_HTTP_SESSION
+    if _TELEGRAM_HTTP_SESSION is None:
+        import requests
+
+        session = requests.Session()
+        session.trust_env = False
+        _TELEGRAM_HTTP_SESSION = session
+    return _TELEGRAM_HTTP_SESSION
+
+
+def _telegram_request_sender(method: str, request_url: str, **kwargs):
+    session = _telegram_http_session()
+    request_kwargs = dict(kwargs)
+    request_kwargs["proxies"] = {}
+    return session.request(method, request_url, **request_kwargs)
+
+
+def _configure_telegram_http_runtime() -> None:
+    _clear_process_proxy_env()
+    try:
+        import telebot.apihelper as apihelper
+
+        session = _telegram_http_session()
+        apihelper.session = session
+        apihelper.proxy = {}
+        apihelper.CUSTOM_REQUEST_SENDER = _telegram_request_sender
+    except Exception:
+        pass
 
 
 def _consciousness_router_enabled() -> bool:
@@ -218,6 +265,7 @@ def main() -> int:
     ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
     ensure_runtime_control(ws_path)
 
+    _configure_telegram_http_runtime()
     bot = telebot.TeleBot(token, parse_mode=None)
     task_q: queue.Queue[tuple[str, int, str, str | None]] = queue.Queue()
     max_iters = int(os.environ.get("TG_DEVCLAW_MAX_ITERS", str(_DEFAULT_ITERS)))
@@ -272,6 +320,7 @@ def main() -> int:
                     err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
                     _dispatch_reply(channel, chat_id, err, request_id=request_id, kind="error")
                 finally:
+                    _configure_telegram_http_runtime()
                     worker_busy.clear()
                     task_q.task_done()
 
