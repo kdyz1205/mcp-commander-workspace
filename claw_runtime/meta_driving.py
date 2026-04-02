@@ -1,8 +1,10 @@
 """
-Meta-driving: periodic autonomous_tick() without user instruction.
+Meta-driving: periodic autonomous reasoning with cost-aware execution planning.
 
-Connects SurvivalEngine, survival_reflex, ultimate (colab/proxy/treasury), evolution.
-Does NOT: Selenium Google login, auto chain txs, third-party top-up APIs.
+This loop stays within repository safety boundaries:
+- no automated top-up APIs
+- no unattended financial execution
+- no wallet spend
 """
 
 from __future__ import annotations
@@ -12,10 +14,12 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from claw_runtime.memory import append_memory
+from claw_runtime.reasoning_episode import append_reasoning_episode, maybe_auto_reasoning_stub
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 
 
@@ -36,12 +40,124 @@ def _append_tick_log(workspace: Path, payload: dict[str, Any]) -> None:
         pass
 
 
-def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
-    """
-    One meta-driving cycle: introspect survival → reflex / colab bundle / proxy / treasury observe / evolve.
+def _task_intent_from_env() -> str:
+    return (
+        os.environ.get("META_TASK_INTENT", "").strip()
+        or "Periodically inspect survival health and choose the cheapest safe execution lane."
+    )
 
-    Returns a dict with state, reason, actions (for logs or TG forwarding).
-    """
+
+@dataclass
+class ReasoningDecision:
+    lane: str
+    complexity: str
+    complexity_score: int
+    rationale: str
+    verify_plan: list[str]
+    should_rotate_proxy: bool
+    should_offload: bool
+    should_prepare_funding_review: bool
+    should_prefer_local: bool
+
+
+class ReasoningOptimizer:
+    def __init__(self, workspace: Path, engine: SurvivalEngine) -> None:
+        self.workspace = Path(workspace).resolve()
+        self.engine = engine
+
+    def _complexity_score(self, task_intent: str) -> tuple[int, str]:
+        text = task_intent.lower()
+        score = 1
+        if any(x in text for x in ("format", "lint", "readme", "docs", "single file", "rename")):
+            score += 1
+        if any(x in text for x in ("refactor", "cross-file", "architecture", "multi-agent", "integration", "migration")):
+            score += 3
+        if len(task_intent) > 180:
+            score += 1
+        if any(x in text for x in ("trading", "strategy", "evolution", "nomad", "survival")):
+            score += 1
+        if score <= 2:
+            return score, "simple"
+        if score <= 4:
+            return score, "moderate"
+        return score, "complex"
+
+    def decide(self, *, task_intent: str, snapshot: dict[str, Any]) -> ReasoningDecision:
+        state = str(snapshot.get("state") or "HEALTHY")
+        quota = snapshot.get("quota", {})
+        vitals = snapshot.get("vitals", {})
+        score, complexity = self._complexity_score(task_intent)
+        rate_pain = int(quota.get("rate_like_events_1h", 0) or 0)
+        quota_pain = int(quota.get("insufficient_quota_events_24h", 0) or 0)
+        mem = float(vitals.get("mem_percent") or 0.0)
+
+        should_rotate_proxy = rate_pain >= 1 and bool(os.environ.get("PROXY_LIST_FILE", "").strip())
+        should_prepare_funding_review = quota_pain > 0 or bool(quota.get("soft_budget_exhausted"))
+        should_offload = state == SurvivalState.DEGRADED.value and score >= 4
+        should_prefer_local = (
+            state == SurvivalState.CRITICAL.value
+            or complexity == "simple"
+            or quota_pain > 0
+            or not bool(quota.get("openai_key_configured"))
+        )
+
+        if state == SurvivalState.CRITICAL.value:
+            lane = "critical_survival"
+        elif should_offload:
+            lane = "degraded_offload"
+        elif should_prefer_local:
+            lane = "local_parasite"
+        elif complexity == "complex":
+            lane = "cloud_limited"
+        else:
+            lane = "hybrid_balanced"
+
+        rationale = (
+            f"Task intent='{task_intent[:160]}'; complexity={complexity}({score}); "
+            f"state={state}; quota_pain={quota_pain}; rate_pain={rate_pain}; mem={mem:.1f}%. "
+        )
+        if lane == "local_parasite":
+            rationale += "Choose local/parasite because the task is cheap enough or cloud survival is constrained."
+        elif lane == "cloud_limited":
+            rationale += "Choose cloud_limited because the task spans multiple files and current vitals are stable."
+        elif lane == "degraded_offload":
+            rationale += "Choose degraded_offload because host resources are tight while the task is complex."
+        elif lane == "critical_survival":
+            rationale += "Choose critical_survival because preserving continuity is more important than feature throughput."
+        else:
+            rationale += "Choose hybrid_balanced because no single lane dominates on cost or complexity."
+
+        verify_plan = [
+            "Check survival snapshot before and after the chosen lane.",
+            "Leave a task_plan reasoning trace with cost and risk trade-offs.",
+            "Prefer read-only or simulation-first actions when finances or external services are involved.",
+        ]
+        return ReasoningDecision(
+            lane=lane,
+            complexity=complexity,
+            complexity_score=score,
+            rationale=rationale,
+            verify_plan=verify_plan,
+            should_rotate_proxy=should_rotate_proxy,
+            should_offload=should_offload,
+            should_prepare_funding_review=should_prepare_funding_review,
+            should_prefer_local=should_prefer_local,
+        )
+
+    def persist_reasoning(self, *, task_intent: str, decision: ReasoningDecision) -> Path:
+        return append_reasoning_episode(
+            self.workspace,
+            trigger=f"meta_tick:{decision.lane}",
+            hypothesis=decision.rationale,
+            verify_plan=decision.verify_plan + [f"Execution lane chosen: {decision.lane}"],
+            revise_hint=(
+                "If the lane underperforms, switch to a cheaper path, rotate proxy if rate pain persists, "
+                "or materialize a new skill via nightly evolution."
+            ),
+        )
+
+
+def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> dict[str, Any]:
     ws = Path(workspace).resolve()
     actions: list[dict[str, Any]] = []
     eng = SurvivalEngine(ws)
@@ -53,10 +169,15 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
     state, reason = eng.assess_survival_state()
     q = eng.check_quota()
     snap = eng.snapshot()
+    task_intent = task_intent or _task_intent_from_env()
+    optimizer = ReasoningOptimizer(ws, eng)
+    decision = optimizer.decide(task_intent=task_intent, snapshot=snap)
+    reasoning_path = optimizer.persist_reasoning(task_intent=task_intent, decision=decision)
+    actions.append({"name": "reasoning_optimizer", "detail": asdict(decision)})
+    actions.append({"name": "reasoning_trace", "detail": str(reasoning_path)})
 
     debounce = float(os.environ.get("META_REFLEX_DEBOUNCE_SEC", "120") or "120")
 
-    # 1) CRITICAL → same reflex as TG (shared debounce)
     if state == SurvivalState.CRITICAL:
         try:
             from claw_runtime.survival_reflex import run_critical_reflex
@@ -66,8 +187,12 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             actions.append({"name": "critical_reflex_error", "detail": str(e)[:500]})
 
-    # 2) DEGRADED host → optional Colab job bundle (no Selenium; user uploads zip)
-    if state == SurvivalState.DEGRADED and _env_bool("META_COLAB_ON_DEGRADED", default=False):
+    colab_degraded = (
+        state == SurvivalState.DEGRADED
+        and _env_bool("META_COLAB_ON_DEGRADED", default=True)
+        and (_env_bool("META_COLAB_ANY_DEGRADED", default=True) or decision.should_offload)
+    )
+    if colab_degraded:
         paths = [p.strip() for p in os.environ.get("META_COLAB_PATHS", "task_plan.md").split(",") if p.strip()]
         try:
             from claw_runtime.ultimate.colab_bundle import build_colab_job_bundle
@@ -75,22 +200,36 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
             z = build_colab_job_bundle(
                 ws,
                 relative_paths=paths,
-                instruction=os.environ.get("META_COLAB_INSTRUCTION", "Host DEGRADED — offload heavy step to Colab (manual upload)."),
+                instruction=os.environ.get(
+                    "META_COLAB_INSTRUCTION",
+                    "Host DEGRADED — Colab offload bundle (manual upload; no automated Google login).",
+                ),
             )
             actions.append({"name": "colab_bundle", "detail": str(z)})
-            append_memory(
-                ws,
-                "lesson",
-                f"[meta_tick] Built Colab bundle at {z} because host DEGRADED: {reason}",
-            )
+            append_memory(ws, "lesson", f"[meta_tick] Offload bundle {z} because {decision.rationale}")
         except Exception as e:  # noqa: BLE001
             actions.append({"name": "colab_bundle_error", "detail": str(e)[:500]})
 
-    # 2b) 推理闭环占位：DEGRADED 或连续失败 → task_plan.md 追加假设-验证段（debounced）
-    if _env_bool("META_REASONING_EPISODE", default=False):
+    if state == SurvivalState.DEGRADED and _env_bool("META_SELF_HEAL_EMIT_ON_DEGRADED", default=True):
+        sh_last = ws / ".claw" / "meta_last_self_heal_emit_ts"
+        now_sh = time.time()
+        sh_gap = float(os.environ.get("META_SELF_HEAL_MIN_SEC", "7200") or "7200")
         try:
-            from claw_runtime.reasoning_episode import maybe_auto_reasoning_stub
+            last_sh = float(sh_last.read_text(encoding="utf-8").strip()) if sh_last.is_file() else 0.0
+        except ValueError:
+            last_sh = 0.0
+        if now_sh - last_sh >= sh_gap:
+            try:
+                from claw_runtime.ultimate.self_heal import emit_rebuild_venv_scripts
 
+                ps1, sh = emit_rebuild_venv_scripts(ws)
+                actions.append({"name": "self_heal_emit", "detail": f"{ps1.name}; {sh.name}"})
+                sh_last.write_text(str(now_sh), encoding="utf-8")
+            except Exception as e:  # noqa: BLE001
+                actions.append({"name": "self_heal_emit_error", "detail": str(e)[:500]})
+
+    if _env_bool("META_REASONING_EPISODE", default=True):
+        try:
             rp = maybe_auto_reasoning_stub(ws, state_value=state.value, reason=reason, snapshot=snap)
             if rp:
                 actions.append({"name": "reasoning_episode", "detail": str(rp)})
@@ -102,70 +241,97 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
         except Exception as e:  # noqa: BLE001
             actions.append({"name": "reasoning_episode_error", "detail": str(e)[:500]})
 
-    # 3) Network pain → rotate proxy from user list (optional VPN_SWITCH_CMD)
-    if int(q.get("rate_like_events_1h", 0) or 0) >= 1 and os.environ.get("PROXY_LIST_FILE", "").strip():
-        if _env_bool("META_PROXY_ROTATE_ON_NET_PAIN", default=True):
-            try:
-                from claw_runtime.ultimate.proxy_env import rotate_proxy_index
+    if decision.should_rotate_proxy and _env_bool("META_PROXY_ROTATE_ON_NET_PAIN", default=True):
+        try:
+            from claw_runtime.ultimate.proxy_env import rotate_proxy_index
 
-                r = rotate_proxy_index(ws)
-                actions.append({"name": "proxy_rotate", "detail": r})
-            except Exception as e:  # noqa: BLE001
-                actions.append({"name": "proxy_rotate_error", "detail": str(e)[:500]})
+            r = rotate_proxy_index(ws)
+            actions.append({"name": "proxy_rotate", "detail": r})
+        except Exception as e:  # noqa: BLE001
+            actions.append({"name": "proxy_rotate_error", "detail": str(e)[:500]})
 
-    # 4) Billing pain → treasury proposal + read-only funding observation (no trade / no top-up)
     if int(q.get("insufficient_quota_events_24h", 0) or 0) > 0:
         try:
-            from claw_runtime.ultimate.treasury import write_treasury_proposal_stub
+            from claw_runtime.ultimate.treasury import write_chain_action_draft, write_treasury_proposal_stub
 
             write_treasury_proposal_stub(
                 ws,
                 reason="insufficient_quota",
                 suggested_actions=[
                     "Fix OpenAI billing or use parasite / Ollama",
-                    "Human-reviewed trading / treasury only",
-                    "Never auto-call third-party top-up APIs from this tick",
+                    "Human-reviewed trading research only",
+                    "Never auto-call top-up APIs from this tick",
                 ],
             )
             actions.append({"name": "treasury_proposal", "detail": ".claw/treasury_proposal.json"})
+            if _env_bool("META_CHAIN_DRAFT_ON_QUOTA", default=True):
+                cd = write_chain_action_draft(ws, reason="insufficient_quota — optional treasury top-up path")
+                actions.append({"name": "chain_action_draft", "detail": str(cd)})
         except Exception as e:  # noqa: BLE001
             actions.append({"name": "treasury_proposal_error", "detail": str(e)[:500]})
-        qlesson = ws / ".claw" / "meta_last_quota_lesson_ts"
-        now = time.time()
+
+    if decision.should_prepare_funding_review:
         try:
-            lastq = float(qlesson.read_text(encoding="utf-8").strip()) if qlesson.is_file() else 0.0
-        except ValueError:
-            lastq = 0.0
-        if now - lastq >= float(os.environ.get("META_QUOTA_LESSON_MIN_SEC", "3600") or "3600"):
-            append_memory(ws, "lesson", f"[meta_tick] insufficient_quota signal; wrote treasury proposal. {reason}")
+            from claw_runtime.ultimate.treasury import prepare_self_funding_review, write_survival_revenue_plan_stub
+
+            review = prepare_self_funding_review(ws, reason=decision.rationale)
+            plan = write_survival_revenue_plan_stub(ws, reason=decision.rationale, okx_enabled=False)
+            actions.append({"name": "self_funding_review", "detail": str(review)})
+            actions.append({"name": "revenue_plan", "detail": str(plan)})
+        except Exception as e:  # noqa: BLE001
+            actions.append({"name": "self_funding_review_error", "detail": str(e)[:500]})
+
+    if _env_bool("META_OBSERVE_FUNDING", default=True):
+        script = ws / "tools" / "trading_funding_binance.py"
+        if script.is_file() and decision.lane in {"cloud_limited", "hybrid_balanced"}:
             try:
-                qlesson.write_text(str(now), encoding="utf-8")
-            except OSError:
-                pass
+                sym = os.environ.get("META_FUNDING_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
+                cp = subprocess.run(
+                    [sys.executable, str(script), sym],
+                    cwd=str(ws),
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                actions.append(
+                    {
+                        "name": "funding_observe",
+                        "detail": (cp.stdout or cp.stderr or "")[:1500],
+                        "returncode": cp.returncode,
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                actions.append({"name": "funding_observe_error", "detail": str(e)[:500]})
 
-        if _env_bool("META_OBSERVE_FUNDING", default=True):
-            script = ws / "tools" / "trading_funding_binance.py"
-            if script.is_file():
-                try:
-                    sym = os.environ.get("META_FUNDING_SYMBOL", "BTCUSDT").strip() or "BTCUSDT"
-                    cp = subprocess.run(
-                        [sys.executable, str(script), sym],
-                        cwd=str(ws),
-                        capture_output=True,
-                        text=True,
-                        timeout=45,
-                    )
-                    actions.append(
-                        {
-                            "name": "funding_observe",
-                            "detail": (cp.stdout or cp.stderr or "")[:1500],
-                            "returncode": cp.returncode,
-                        }
-                    )
-                except Exception as e:  # noqa: BLE001
-                    actions.append({"name": "funding_observe_error", "detail": str(e)[:500]})
+    if _env_bool("META_SYNTHESIS_ON_TICK", default=True):
+        syn_last = ws / ".claw" / "meta_last_synthesis_ts"
+        now_syn = time.time()
+        syn_gap = float(os.environ.get("META_SYNTHESIS_MIN_SEC", "86400") or "86400")
+        try:
+            last_syn = float(syn_last.read_text(encoding="utf-8").strip()) if syn_last.is_file() else 0.0
+        except ValueError:
+            last_syn = 0.0
+        if now_syn - last_syn >= syn_gap:
+            try:
+                from claw_runtime.skill_registry import SkillRegistry
+                from claw_runtime.ultimate.skill_synthesis import synthesize_two_skills
 
-    # 5) Optional: materialize evolve draft (debounced)
+                reg = SkillRegistry(ws)
+                names = sorted(reg.refresh().keys())
+                pair_raw = os.environ.get("META_SYNTHESIS_PAIR", "").strip()
+                if pair_raw and "," in pair_raw:
+                    a, b = [x.strip() for x in pair_raw.split(",", 1)]
+                elif len(names) >= 2:
+                    a, b = names[0], names[1]
+                else:
+                    a, b = "", ""
+                if a and b and a != b:
+                    out_dir, _note = synthesize_two_skills(ws, a, b)
+                    actions.append({"name": "skill_synthesis", "detail": str(out_dir)})
+                    syn_last.write_text(str(now_syn), encoding="utf-8")
+            except Exception as e:  # noqa: BLE001
+                actions.append({"name": "skill_synthesis_error", "detail": str(e)[:500]})
+
     if _env_bool("META_EVOLVE_ON_TICK", default=False):
         last_path = ws / ".claw" / "meta_last_evolve_ts"
         now = time.time()
@@ -189,9 +355,11 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
 
     out: dict[str, Any] = {
         "ts": time.time(),
+        "task_intent": task_intent,
         "state": state.value,
         "reason": reason,
         "snapshot": snap,
+        "decision": asdict(decision),
         "actions": actions,
     }
     _append_tick_log(ws, out)
@@ -199,14 +367,13 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
 
 
 def run_autonomous_loop(workspace: Path | str, interval_sec: float) -> None:
-    """Blocking loop for `py dev_claw/main.py --autonomous`."""
     ws = Path(workspace).resolve()
     interval_sec = max(15.0, float(interval_sec))
     print(f"[meta-driving] workspace={ws} interval={interval_sec}s (Ctrl+C to stop)")
     while True:
         try:
             summary = autonomous_tick(ws)
-            print(json.dumps({k: summary[k] for k in ("state", "reason", "actions")}, ensure_ascii=False, indent=2))
+            print(json.dumps({k: summary[k] for k in ("state", "decision", "actions")}, ensure_ascii=False, indent=2))
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001

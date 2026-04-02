@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -23,16 +23,19 @@ if _REPO_ROOT not in sys.path:
 try:
     from openai import OpenAI
 except ImportError:
-    print("Missing openai. Run: py -m pip install -r dev_claw/requirements.txt", file=sys.stderr)
-    raise SystemExit(1) from None
+    OpenAI = None  # type: ignore[assignment]
 
 from claw_runtime.memory import append_memory
+from claw_runtime.offline_brain import run_offline_brain
 from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
 from claw_runtime.session_log import log_tool
 from claw_runtime.skill_registry import SkillRegistry
 from claw_runtime.quota_tracker import QuotaTracker
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 from claw_runtime.survival_reflex import run_critical_reflex
+from claw_runtime.ultimate.nomad import load_nomad_system_append
+from claw_runtime.ultimate.proxy_env import apply_proxy_env, current_proxy_env
+from claw_runtime.ultimate.self_heal import emit_rebuild_venv_scripts
 
 
 def _workspace_root() -> str:
@@ -45,6 +48,26 @@ def _workspace_root() -> str:
 MAX_TOOL_CHARS = 120_000
 TERMINAL_TIMEOUT = int(os.environ.get("DEVCLAW_TERMINAL_TIMEOUT", "120"))
 WEB_FETCH_MAX = int(os.environ.get("DEVCLAW_WEB_FETCH_MAX", "1500000"))
+
+
+def _ensure_utf8_stdio() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _offline_brain_enabled() -> bool:
+    return os.environ.get("DEVCLAW_OFFLINE_BRAIN", "auto").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _openai_error_corpus(err: Exception) -> str:
@@ -197,12 +220,24 @@ def web_fetch(url: str) -> str:
     """HTTP GET text/html/json; size-capped."""
     print(f"\n[web_fetch] {url}")
     try:
+        proxy_map = current_proxy_env(_workspace_root())
+        handlers = []
+        if proxy_map:
+            mapped: dict[str, str] = {}
+            if proxy_map.get("HTTP_PROXY"):
+                mapped["http"] = proxy_map["HTTP_PROXY"]
+            if proxy_map.get("HTTPS_PROXY"):
+                mapped["https"] = proxy_map["HTTPS_PROXY"]
+            if mapped:
+                handlers.append(ProxyHandler(mapped))
         req = Request(
             url,
             headers={"User-Agent": "DevClaw-web_fetch/1.0"},
             method="GET",
         )
-        with urlopen(req, timeout=45) as resp:
+        opener = build_opener(*handlers) if handlers else None
+        open_fn = opener.open if opener is not None else urlopen
+        with open_fn(req, timeout=45) as resp:
             data = resp.read(WEB_FETCH_MAX + 1)
         if len(data) > WEB_FETCH_MAX:
             return f"响应超过 {WEB_FETCH_MAX} 字节，已拒绝（请换 API 或缩小范围）。"
@@ -386,7 +421,8 @@ def dev_claw_run(
     *,
     system_append: str | None = None,
     progress_hook: Callable[[str], None] | None = None,
-) -> None:
+    _resume_depth: int = 0,
+) -> bool:
     """
     Meta-cognition hooks (see also `claw_runtime/survival_reflex.py`):
 
@@ -398,15 +434,27 @@ def dev_claw_run(
         if progress_hook:
             progress_hook(text)
 
+    _ensure_utf8_stdio()
     ws = _workspace_root()
     workspace_path = Path(ws)
     survival = SurvivalEngine(workspace_path)
     exit_success = False
 
     try:
+        apply_proxy_env(workspace_path)
         parasite = survival.parasite_active()
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
         if not parasite and not api_key:
+            if _offline_brain_enabled():
+                result = run_offline_brain(
+                    workspace_path,
+                    user_instruction,
+                    emit=_emit if progress_hook else None,
+                    failure_reason="OPENAI_API_KEY missing",
+                )
+                _emit("[完成]\n" + result.summary)
+                exit_success = True
+                return True
             msg = (
                 "请设置 OPENAI_API_KEY；或在 CRITICAL 后由生存反射开启寄生模式，"
                 "并配置 OLLAMA_BASE_URL + OLLAMA_MODEL；也可手动 DEVCLAW_PARASITE_MODE=1。"
@@ -415,15 +463,41 @@ def dev_claw_run(
             _emit(msg)
             if not progress_hook:
                 raise SystemExit(1)
-            return
+            return False
 
         if parasite:
             base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434/v1").strip()
             okey = os.environ.get("OLLAMA_API_KEY", "ollama").strip() or "ollama"
             model = os.environ.get("OLLAMA_MODEL", "llama3.2").strip() or "llama3.2"
+            if OpenAI is None:
+                if _offline_brain_enabled():
+                    result = run_offline_brain(
+                        workspace_path,
+                        user_instruction,
+                        emit=_emit if progress_hook else None,
+                        failure_reason="openai package missing for parasite mode",
+                    )
+                    _emit("[完成]\n" + result.summary)
+                    exit_success = True
+                    return True
+                print("Missing openai package for parasite mode.", file=sys.stderr)
+                return False
             client = OpenAI(base_url=base_url, api_key=okey)
             quota_platform: str | None = None
         else:
+            if OpenAI is None:
+                if _offline_brain_enabled():
+                    result = run_offline_brain(
+                        workspace_path,
+                        user_instruction,
+                        emit=_emit if progress_hook else None,
+                        failure_reason="openai package missing",
+                    )
+                    _emit("[完成]\n" + result.summary)
+                    exit_success = True
+                    return True
+                print("Missing openai. Run: py -m pip install -r dev_claw/requirements.txt", file=sys.stderr)
+                return False
             client = OpenAI(api_key=api_key)
             model = os.environ.get("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
             quota_platform = "openai"
@@ -431,6 +505,7 @@ def dev_claw_run(
         skills_on = os.environ.get("DEVCLAW_SKILLS", "1").strip().lower() not in {"0", "false", "no"}
         registry = SkillRegistry(workspace_path)
         qt = QuotaTracker(workspace_path) if quota_platform else None
+        nomad_append = load_nomad_system_append(workspace_path)
 
         print("==================================================")
         print("DevClaw / workspace:", ws)
@@ -438,6 +513,18 @@ def dev_claw_run(
         print("skills:", "on" if skills_on else "off")
         print("instruction:", user_instruction)
         print("==================================================\n")
+
+        if os.environ.get("DEVCLAW_AUTO_SELF_HEAL_ON_CRITICAL", "1").strip().lower() not in {"0", "false", "no"}:
+            pre_state, pre_reason = survival.assess_survival_state()
+            if pre_state == SurvivalState.CRITICAL:
+                try:
+                    ps1, sh = emit_rebuild_venv_scripts(workspace_path)
+                    _emit(
+                        "[自愈准备] 检测到 CRITICAL，已刷新环境修复脚本："
+                        f"{ps1.name}, {sh.name}。原因: {pre_reason}"
+                    )
+                except Exception:
+                    pass
 
         mode_line = "寄生模式 (Ollama / 本地兼容)" if parasite else "云端 OpenAI"
         _emit(
@@ -478,6 +565,8 @@ def dev_claw_run(
                 "使用自备代理列表（`PROXY_LIST_FILE` / `skills/proxy_rotator`）以及 `web_fetch` 获取公开文档。"
                 "禁止协助入侵、未授权数据窃取、恶意软件或任何违法行为。"
             )
+        if nomad_append:
+            base_core = base_core + "\n\n[Nomad Context]\n" + nomad_append
         if system_append:
             base_core = base_core + "\n\n" + system_append.strip()
 
@@ -523,7 +612,7 @@ def dev_claw_run(
                         msg = f"[生存状态 CRITICAL] {reason}\n已中止本轮 API 调用（避免浪费额度）。"
                         print(msg, file=sys.stderr)
                         _emit(msg)
-                        return
+                        return False
 
             if skills_on:
                 messages[0]["content"] = base_core + "\n\n" + registry.catalog_text()
@@ -531,7 +620,7 @@ def dev_claw_run(
             if qt and quota_platform and not qt.is_available(quota_platform):
                 msg = "[配额] 估计窗口内 OpenAI 次数已用尽或处于冷却，请等待或启用寄生模式。"
                 _emit(msg)
-                return
+                return False
 
             try:
                 response = client.chat.completions.create(
@@ -561,7 +650,27 @@ def dev_claw_run(
                     )
                     print(msg, file=sys.stderr)
                     _emit(msg)
-                    return
+                    if _resume_depth < 1:
+                        _emit("[Fallback] 尝试自动切换到寄生模式继续当前任务。")
+                        exit_success = dev_claw_run(
+                            user_instruction,
+                            max_iterations=max_iterations,
+                            system_append=system_append,
+                            progress_hook=progress_hook,
+                            _resume_depth=_resume_depth + 1,
+                        )
+                        return exit_success
+                    if _offline_brain_enabled():
+                        result = run_offline_brain(
+                            workspace_path,
+                            user_instruction,
+                            emit=_emit if progress_hook else None,
+                            failure_reason="cloud quota exhausted and parasite unavailable",
+                        )
+                        _emit("[完成]\n" + result.summary)
+                        exit_success = True
+                        return True
+                    return False
 
                 if _is_rate_limit_api_error(e) and os.environ.get("DEVCLAW_REFLEX_ON_429", "").strip().lower() in {
                     "1",
@@ -580,7 +689,7 @@ def dev_claw_run(
                     )
                     print(msg, file=sys.stderr)
                     _emit(msg)
-                    return
+                    return False
 
                 if _is_rate_limit_api_error(e):
                     msg = (
@@ -589,7 +698,19 @@ def dev_claw_run(
                     )
                     print(msg, file=sys.stderr)
                     _emit(msg)
-                    return
+                    return False
+
+                if parasite and _offline_brain_enabled():
+                    _emit("[Fallback] 本地兼容端点不可达，转入离线降级脑。")
+                    result = run_offline_brain(
+                        workspace_path,
+                        user_instruction,
+                        emit=_emit if progress_hook else None,
+                        failure_reason=f"parasite backend failure: {type(e).__name__}: {e!s}",
+                    )
+                    _emit("[完成]\n" + result.summary)
+                    exit_success = True
+                    return True
 
                 raise
 
@@ -609,7 +730,7 @@ def dev_claw_run(
                 print(final_text)
                 _emit("[完成]\n" + (final_text or "（模型未返回文本）"))
                 exit_success = True
-                return
+                return True
 
             for tool_call in response_message.tool_calls:
                 name = tool_call.function.name
@@ -685,10 +806,17 @@ def dev_claw_run(
 
         print(f"\n[DevClaw] 达到最大迭代次数 {max_iterations}，停止。")
         _emit(f"[停止] 已达最大迭代次数 {max_iterations}，请缩短任务或提高 --max-iters。")
+        return False
 
     finally:
         try:
             survival.record_task_outcome(exit_success)
+            if exit_success and os.environ.get("DEVCLAW_TRACK_SOFT_CREDITS", "1").strip().lower() not in {
+                "0",
+                "false",
+                "no",
+            }:
+                survival.record_soft_credit_use(1)
         except Exception:
             pass
 
@@ -737,8 +865,8 @@ def main() -> int:
         text = (
             "读取 task_plan.md（若不存在则创建模板），列出下一步要在本仓库执行的最小验证命令。"
         )
-    dev_claw_run(text, max_iterations=args.max_iters)
-    return 0
+    ok = dev_claw_run(text, max_iterations=args.max_iters)
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

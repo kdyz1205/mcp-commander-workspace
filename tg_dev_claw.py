@@ -23,6 +23,8 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
 运行（建议在本仓库根目录）:
   py tg_dev_claw.py
   或 scripts/start-tg-bot.ps1
+
+  NOMAD_AUTO_REGISTER=1（默认）— 注册关机/SIGINT 快照；NOMAD_GIT_PUSH=1 时才在钩子内 push
 """
 
 from __future__ import annotations
@@ -512,7 +514,9 @@ def main() -> int:
 
     threading.Thread(target=autonomous_life_loop, daemon=True, name="autonomous-life").start()
 
-    if os.environ.get("NOMAD_REGISTER_HANDLERS", "").strip().lower() in {"1", "true", "yes"}:
+    _nomad_auto = os.environ.get("NOMAD_AUTO_REGISTER", "1").strip().lower() not in {"0", "false", "no"}
+    _nomad_legacy = os.environ.get("NOMAD_REGISTER_HANDLERS", "").strip().lower() in {"1", "true", "yes"}
+    if _nomad_auto or _nomad_legacy:
         from claw_runtime.ultimate.nomad import register_nomad_handlers
 
         register_nomad_handlers(Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)))
