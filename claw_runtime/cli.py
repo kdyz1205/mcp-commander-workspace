@@ -50,6 +50,18 @@ def cmd_plugins_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_evolve_draft(args: argparse.Namespace) -> int:
+    ws = Path(args.workspace).resolve()
+    from claw_runtime.nightly_evolution import materialize_draft_skill
+
+    out = materialize_draft_skill(ws)
+    if out:
+        print(out)
+        return 0
+    print("No failure log entries.", file=sys.stderr)
+    return 1
+
+
 def cmd_multi(args: argparse.Namespace) -> int:
     ws = Path(args.workspace).resolve()
     os.environ["DEVCLAW_WORKSPACE"] = str(ws)
@@ -89,6 +101,9 @@ def main() -> int:
 
     pl = sub.add_parser("plugins-list", help="List plugin skill directories")
     pl.set_defaults(func=cmd_plugins_list)
+
+    ev = sub.add_parser("evolve-draft", help="Materialize draft SKILL from evolution failure log")
+    ev.set_defaults(func=cmd_evolve_draft)
 
     mu = sub.add_parser("multi-agent", help="Run phased planner/builder/auditor pipeline")
     mu.add_argument("instruction", nargs="+")

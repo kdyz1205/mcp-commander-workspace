@@ -15,6 +15,10 @@
 | OpenClaw 运行时 | `claw_runtime/` + `skills/*/SKILL.md` | `load_skill` / `claw.config.json` | YAML frontmatter、插件 skills、安装/扫描/多 Agent CLI |
 | Claw CLI | `python -m claw_runtime.cli` | `skills-install` / `safety-scan` / `plugins-list` / `multi-agent` | 见 `--workspace` |
 | 生存引擎 Phase1 | `claw_runtime/survival_engine.py` | DevClaw 每轮 `heartbeat` + API 失败 `record_api_error`；`DEVCLAW_SURVIVAL_GATE=0` 可关闭门禁 | 状态 `.claw/survival_state.json`；对齐 claude-tg-bot 的 vital/quota 思路 |
+| 生存反射 + 寄生 | `claw_runtime/survival_reflex.py` + `tg_dev_claw.py` 后台线程 | CRITICAL 时写根目录 `CURSOR_OUTBOX.md`、TG 广播、`set_parasite_mode`；`/parasite_off` 清除 | 与 `SURVIVAL_TICK_SEC` / `SURVIVAL_REFLEX_DEBOUNCE_SEC` 配合 |
+| 意识路由 | `claw_runtime/consciousness_router.py` | TG 文本合并进 `system_append`；`TG_CONSCIOUSNESS_ROUTER=0` 关闭 | 轻量关键词路由，非云端大模型 |
+| 夜间进化草稿 | `claw_runtime/nightly_evolution.py` | `py -m claw_runtime.cli --workspace . evolve-draft` 或 TG `/evolve` | 从 `.claw/evolution_failures.jsonl` 生成 `skills/auto_evolve_*` |
+| 交易技能（可插拔） | `skills/trading_*` + `tools/trading_funding_binance.py` | `load_skill` 名见各 SKILL frontmatter | 重逻辑见 [claude-tg-bot/trading_skills](https://github.com/kdyz1205/claude-tg-bot/tree/master/trading_skills) |
 
 ## 登记规范
 

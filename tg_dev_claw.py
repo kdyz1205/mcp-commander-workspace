@@ -10,6 +10,9 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
   DEVCLAW_WORKSPACE  — 可选，默认同本脚本所在目录
   OPENAI_MODEL       — 可选
   TG_DEVCLAW_SYSTEM_APPEND — 可选，附加 system 提示
+  TG_CONSCIOUSNESS_ROUTER — 默认 1；设为 0 关闭交易/工程关键词路由
+  SURVIVAL_TICK_SEC — 后台生存检查间隔（默认 60）
+  SURVIVAL_REFLEX_DEBOUNCE_SEC — CRITICAL 时 TG/OUTBOX 去抖秒数（默认 300）
 
 运行（建议在本仓库根目录）:
   py tg_dev_claw.py
@@ -18,11 +21,14 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
 import threading
+import time
 import traceback
+from pathlib import Path
 from typing import Set
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -43,10 +49,30 @@ except ImportError:
     print("请安装: py -m pip install -r requirements-telegram.txt", file=sys.stderr)
     raise SystemExit(1) from None
 
+from claw_runtime.consciousness_router import route_message
+from claw_runtime.nightly_evolution import append_evolution_failure
+from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
+from claw_runtime.survival_reflex import run_critical_reflex
 from dev_claw.main import dev_claw_run
 
 TG_CHUNK = 3800
 _DEFAULT_ITERS = 24
+
+
+def _consciousness_router_enabled() -> bool:
+    return os.environ.get("TG_CONSCIOUSNESS_ROUTER", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def _merged_system_append(instruction: str) -> str | None:
+    parts: list[str] = []
+    base = os.environ.get("TG_DEVCLAW_SYSTEM_APPEND", "").strip()
+    if base:
+        parts.append(base)
+    if _consciousness_router_enabled():
+        r = route_message(instruction)
+        if r.system_injection:
+            parts.append(r.system_injection)
+    return "\n\n".join(parts) if parts else None
 
 
 def _admin_ids() -> Set[str]:
@@ -84,6 +110,9 @@ def _register_bot_commands(bot: telebot.TeleBot) -> None:
         types.BotCommand("ping", "存活检测"),
         types.BotCommand("status", "队列与工作区状态"),
         types.BotCommand("cancel", "取消说明（单 worker 版）"),
+        types.BotCommand("vitals", "生存引擎快照（心跳/配额/寄生）"),
+        types.BotCommand("parasite_off", "关闭寄生模式标记"),
+        types.BotCommand("evolve", "从失败日志生成草稿 SKILL（需人工审）"),
     ]
     try:
         bot.set_my_commands(cmds)
@@ -124,8 +153,10 @@ def main() -> int:
     _register_bot_commands(bot)
 
     def worker() -> None:
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         while True:
             chat_id, instruction = task_q.get()
+            merged = _merged_system_append(instruction) or system_append
             try:
 
                 def hook(msg: str) -> None:
@@ -137,10 +168,14 @@ def main() -> int:
                 dev_claw_run(
                     instruction,
                     max_iterations=max_iters,
-                    system_append=system_append,
+                    system_append=merged,
                     progress_hook=hook,
                 )
             except Exception as e:  # noqa: BLE001
+                try:
+                    append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
+                except Exception:
+                    pass
                 err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
                 try:
                     _send_chunks(bot, chat_id, err)
@@ -150,6 +185,36 @@ def main() -> int:
                 task_q.task_done()
 
     threading.Thread(target=worker, daemon=True, name="devclaw-worker").start()
+
+    def _broadcast_admins(text: str) -> None:
+        for aid in admins:
+            try:
+                bot.send_message(int(aid), text[:TG_CHUNK])
+            except Exception:
+                pass
+
+    def survival_heartbeat_loop() -> None:
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        tick = int(os.environ.get("SURVIVAL_TICK_SEC", "60") or "60")
+        debounce = float(os.environ.get("SURVIVAL_REFLEX_DEBOUNCE_SEC", "300") or "300")
+        time.sleep(min(tick, 5))
+        while True:
+            try:
+                eng = SurvivalEngine(ws_path)
+                eng.heartbeat()
+                st, _reason = eng.assess_survival_state()
+                if st == SurvivalState.CRITICAL:
+                    run_critical_reflex(
+                        ws_path,
+                        eng,
+                        debounce_sec=debounce,
+                        notify=_broadcast_admins,
+                    )
+            except Exception:
+                pass
+            time.sleep(max(15, tick))
+
+    threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()
 
     # ---- 命令处理器（勿用纯 content_types=text 抢 /start）----
 
@@ -199,6 +264,44 @@ def main() -> int:
             "说明: 单 worker 串行处理，上一条跑完才处理下一条。",
         )
 
+    @bot.message_handler(commands=["vitals"])
+    def cmd_vitals(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        eng = SurvivalEngine(ws_path)
+        eng.heartbeat()
+        snap = eng.snapshot()
+        body = json.dumps(snap, ensure_ascii=False, indent=2)[:3500]
+        bot.reply_to(message, "Survival snapshot:\n```\n" + body + "\n```", parse_mode=None)
+
+    @bot.message_handler(commands=["parasite_off"])
+    def cmd_parasite_off(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        SurvivalEngine(ws_path).set_parasite_mode(False)
+        bot.reply_to(message, "已关闭寄生模式标记（.claw/parasite_mode.json 已清除）。可 unset DEVCLAW_PARASITE_MODE。")
+
+    @bot.message_handler(commands=["evolve"])
+    def cmd_evolve(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        from claw_runtime.nightly_evolution import materialize_draft_skill
+
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        out = materialize_draft_skill(ws_path)
+        if out:
+            bot.reply_to(message, f"已生成草稿技能:\n`{out}`\n请人工审阅 SKILL.md。", parse_mode=None)
+        else:
+            bot.reply_to(message, "暂无 .claw/evolution_failures.jsonl 记录，未生成草稿。")
+
     @bot.message_handler(commands=["cancel"])
     def cmd_cancel(message: telebot.types.Message) -> None:
         cid = str(message.chat.id)
@@ -230,7 +333,10 @@ def main() -> int:
             "/whoami — 查看 chat_id\n"
             "/ping — 在线检测\n"
             "/status — 队列与工作区\n"
-            "/cancel — 取消说明\n\n"
+            "/cancel — 取消说明\n"
+            "/vitals — 生存引擎快照\n"
+            "/parasite_off — 关闭寄生模式\n"
+            "/evolve — 失败日志 → 草稿 SKILL\n\n"
             f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
             f"最大迭代: {max_iters}\n\n"
             "直接发普通文字（不以 / 开头）会入队交给 DevClaw 执行。",

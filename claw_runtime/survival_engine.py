@@ -226,4 +226,73 @@ class SurvivalEngine:
             "reason": reason,
             "vitals": v,
             "quota": q,
+            "consecutive_failures": self.consecutive_failures(),
+            "parasite_active": self.parasite_active(),
         }
+
+    # --- Parasite mode (local / free LLM path) ---------------------------------
+
+    def parasite_mode_path(self) -> Path:
+        return self.workspace / ".claw" / "parasite_mode.json"
+
+    def parasite_active(self) -> bool:
+        if os.environ.get("DEVCLAW_PARASITE_MODE", "").strip().lower() in {"1", "true", "yes"}:
+            return True
+        p = self.parasite_mode_path()
+        if not p.is_file():
+            return False
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return bool(data.get("active"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return False
+
+    def set_parasite_mode(self, active: bool, reason: str = "") -> None:
+        p = self.parasite_mode_path()
+        with self._lock:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                if not active:
+                    if p.exists():
+                        p.unlink()
+                    return
+                data = {"active": True, "reason": (reason or "")[:800], "ts": time.time()}
+                tmp = p.with_suffix(".tmp")
+                tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+                tmp.replace(p)
+            except OSError:
+                pass
+
+    # --- Task outcomes → jailbreak escalation (aligned with self_repair loops) ---
+
+    def consecutive_failures(self) -> int:
+        with self._lock:
+            st = self._load_state()
+            return int(st.get("consecutive_failures", 0))
+
+    def record_task_outcome(self, success: bool) -> None:
+        with self._lock:
+            st = self._load_state()
+            if success:
+                st["consecutive_failures"] = 0
+            else:
+                st["consecutive_failures"] = int(st.get("consecutive_failures", 0)) + 1
+            self._save_state(st)
+
+    def jailbreak_escalated(self) -> bool:
+        thr = _env_int("DEVCLAW_JAILBREAK_FAIL_THRESHOLD", 5)
+        return self.consecutive_failures() >= max(1, thr)
+
+    # --- Critical reflex debounce (TG heartbeat) ------------------------------
+
+    def try_acquire_critical_reflex_slot(self, debounce_sec: float) -> bool:
+        """Return True if caller should run outbox+TG+parasite (not within debounce)."""
+        now = time.time()
+        with self._lock:
+            st = self._load_state()
+            last = float(st.get("last_critical_reflex_ts", 0) or 0)
+            if now - last < debounce_sec:
+                return False
+            st["last_critical_reflex_ts"] = now
+            self._save_state(st)
+            return True
