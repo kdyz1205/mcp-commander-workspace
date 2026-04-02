@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "id": "web_agent_dex",
+      "title": "自然语言拉取 DexScreener / 现货参考",
+      "path": "tools/web_agent.py",
+      "invoke": "py tools\\\\web_agent.py \"<query>\"",
+      "notes": "无 key 基础行情；与链上聪明钱无直接等价，需另接索引器。"
+    },
+    {
+      "id": "digital_engineer_hire",
+      "title": "雇佣数字 AI 工程师（Bot 迭代 / 修 Bug）",
+      "path": "digital_engineer/hire.py",
+      "invoke": "py digital_engineer\\\\hire.py --bot-root <repo> \"<instruction>\"",
+      "notes": "需 OPENAI_API_KEY；cwd/写文件均在 DEVCLAW_WORKSPACE 或 --bot-root；高风险 shell 命令由人工审。"
+    }
+  ]
+}
