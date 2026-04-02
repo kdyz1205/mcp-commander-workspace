@@ -47,14 +47,42 @@ TERMINAL_TIMEOUT = int(os.environ.get("DEVCLAW_TERMINAL_TIMEOUT", "120"))
 WEB_FETCH_MAX = int(os.environ.get("DEVCLAW_WEB_FETCH_MAX", "1500000"))
 
 
+def _openai_error_corpus(err: Exception) -> str:
+    """Collect text/JSON from OpenAI SDK errors (body is often absent from str(e))."""
+    parts: list[str] = [str(err), repr(err)]
+    code = getattr(err, "code", None)
+    if code is not None:
+        parts.append(str(code))
+    msg = getattr(err, "message", None)
+    if isinstance(msg, str) and msg.strip():
+        parts.append(msg)
+    body = getattr(err, "body", None)
+    if body is not None:
+        try:
+            parts.append(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else repr(body))
+        except (TypeError, ValueError):
+            parts.append(repr(body))
+    resp = getattr(err, "response", None)
+    if resp is not None:
+        try:
+            txt = getattr(resp, "text", None)
+            if txt:
+                parts.append(str(txt)[:4000])
+        except Exception:
+            pass
+    return "\n".join(parts).lower()
+
+
 def _survival_record_api_error(workspace_path: Path, err: Exception) -> None:
     try:
         se = SurvivalEngine(workspace_path)
-        msg = str(err).lower()
+        blob = _openai_error_corpus(err)
         code = type(err).__name__
-        if "insufficient_quota" in msg:
+        if "insufficient_quota" in blob:
             code = "insufficient_quota"
-        elif "429" in str(err) or "rate limit" in msg:
+        elif getattr(err, "status_code", None) == 429 or "rate_limit_exceeded" in blob:
+            code = "429"
+        elif "429" in blob or "rate limit" in blob:
             code = "429"
         se.record_api_error(code, str(err)[:1200])
     except Exception:
@@ -65,20 +93,32 @@ def _is_quota_exhausted_error(err: Exception) -> bool:
     code = getattr(err, "code", None)
     if code == "insufficient_quota":
         return True
-    s = str(err).lower()
-    if "insufficient_quota" in s:
+    blob = _openai_error_corpus(err)
+    if "insufficient_quota" in blob:
         return True
-    if "exceeded your current quota" in s or "billing_hard_limit" in s:
+    if "exceeded your current quota" in blob or "billing_hard_limit" in blob:
         return True
+    try:
+        body = getattr(err, "body", None)
+        if isinstance(body, dict):
+            err_obj = body.get("error")
+            if isinstance(err_obj, dict) and err_obj.get("code") == "insufficient_quota":
+                return True
+    except Exception:
+        pass
     return False
 
 
 def _is_rate_limit_api_error(err: Exception) -> bool:
+    if _is_quota_exhausted_error(err):
+        return False
+    if getattr(err, "status_code", None) == 429:
+        return True
     code = getattr(err, "code", None)
     if code == "rate_limit_exceeded":
         return True
-    s = str(err).lower()
-    return "429" in str(err) or "rate limit" in s or "too many requests" in s
+    blob = _openai_error_corpus(err)
+    return "429" in blob or "rate limit" in blob or "too many requests" in blob
 
 
 def execute_terminal(command: str) -> str:
@@ -508,7 +548,7 @@ def dev_claw_run(
                 reflex_db = float(os.environ.get("DEVCLAW_REFLEX_DEBOUNCE_SEC", "60") or "60")
                 tg_notify = (lambda t: _emit(t)) if progress_hook else None
 
-                if _is_quota_exhausted_error(e) and quota_platform:
+                if _is_quota_exhausted_error(e):
                     run_critical_reflex(
                         workspace_path,
                         survival,
@@ -517,7 +557,7 @@ def dev_claw_run(
                     )
                     msg = (
                         "[生存反射] 云端额度不足（insufficient_quota / billing）。"
-                        "已强制寄生模式并写入 CURSOR_OUTBOX.md；下一轮将走 Ollama（请配置 OLLAMA_*）。"
+                        "已强制寄生模式并写入 CURSOR_OUTBOX.md；请配置 OLLAMA_BASE_URL + OLLAMA_MODEL 后**再发一条消息**走本地大脑，或在平台充值后 /parasite_off。"
                     )
                     print(msg, file=sys.stderr)
                     _emit(msg)
