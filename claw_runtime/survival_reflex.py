@@ -1,5 +1,5 @@
 """
-CRITICAL survival reflex: CURSOR_OUTBOX.md + parasite mode + optional TG ping.
+CRITICAL survival reflex: downgrade brain (parasite / local Ollama) + CURSOR_OUTBOX.md + optional TG ping.
 
 Triggered by tg_dev_claw heartbeat (debounced) or manually. Policy-safe: no illegal actions.
 """
@@ -13,6 +13,9 @@ from typing import Any, Callable
 
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 
+# Shown in .claw/parasite_mode.json — DevClaw reads this and routes to Ollama-compatible API.
+PARASITE_REASON_REFLEX = "API Quota Exhausted - Auto Switch to Local Brain"
+
 
 def _format_outbox(snapshot: dict[str, Any]) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
@@ -23,6 +26,11 @@ def _format_outbox(snapshot: dict[str, Any]) -> str:
         f"**State:** {snapshot.get('state')}",
         f"**Reason:** {snapshot.get('reason', '')}",
         "",
+        "## Brain downgrade",
+        "",
+        f"Parasite mode was **forced ON** with reason: `{PARASITE_REASON_REFLEX}`.",
+        "Configure `OLLAMA_BASE_URL` + `OLLAMA_MODEL` (see `env.example`). Clear with TG `/parasite_off` or delete `.claw/parasite_mode.json` when cloud is healthy again.",
+        "",
         "## Vitals snapshot",
         "",
         "```json",
@@ -32,12 +40,32 @@ def _format_outbox(snapshot: dict[str, Any]) -> str:
         "## What to do in Cursor (human or Agent)",
         "",
         "1. If `insufficient_quota` / billing: add credits or switch API key; then clear parasite if you want cloud again.",
-        "2. If rate limits: reduce `TG_DEVCLAW_MAX_ITERS`, wait, or use local **Ollama** (`OLLAMA_BASE_URL`, `OLLAMA_MODEL`).",
+        "2. If rate limits: reduce `TG_DEVCLAW_MAX_ITERS`, wait, or keep local **Ollama**.",
         "3. If disk/memory: free space or close apps; tune `SURVIVAL_*` env vars in `env.example`.",
-        "4. Parasite mode is ON: DevClaw will prefer local OpenAI-compatible endpoint until you `/parasite_off` in TG or delete `.claw/parasite_mode.json`.",
+        "4. Parasite mode is ON: DevClaw uses local OpenAI-compatible endpoint until you explicitly turn it off.",
         "",
     ]
     return "\n".join(lines)
+
+
+def write_cursor_outbox(
+    workspace: Path,
+    snapshot: dict[str, Any],
+    *,
+    outbox_path: Path | None = None,
+) -> Path | None:
+    """
+    Write CURSOR_OUTBOX.md from a survival snapshot (for Cursor collaboration / human handoff).
+    Returns the path written, or None on failure.
+    """
+    workspace = Path(workspace).resolve()
+    ob = outbox_path or (workspace / "CURSOR_OUTBOX.md")
+    body = _format_outbox(snapshot)
+    try:
+        ob.write_text(body, encoding="utf-8")
+        return ob
+    except OSError:
+        return None
 
 
 def run_critical_reflex(
@@ -49,7 +77,11 @@ def run_critical_reflex(
     outbox_path: Path | None = None,
 ) -> bool:
     """
-    If state is CRITICAL and debounce allows: write CURSOR_OUTBOX.md, enable parasite, optional notify.
+    If state is CRITICAL and debounce allows:
+    1. Force parasite mode (local Ollama / OpenAI-compatible) — downgrade brain.
+    2. write_cursor_outbox — SOS for Cursor.
+    3. Treasury stub + optional TG notify.
+
     Returns True if reflex actions ran.
     """
     workspace = Path(workspace).resolve()
@@ -60,14 +92,12 @@ def run_critical_reflex(
         return False
 
     snap = engine.snapshot()
-    body = _format_outbox(snap)
-    ob = outbox_path or (workspace / "CURSOR_OUTBOX.md")
-    try:
-        ob.write_text(body, encoding="utf-8")
-    except OSError:
-        pass
 
-    engine.set_parasite_mode(True, reason)
+    # 1) 强制降级大脑 → 寄生 / 本地 Ollama（避免继续烧云端额度）
+    engine.set_parasite_mode(True, PARASITE_REASON_REFLEX)
+
+    # 2) 求救信 → Cursor 协作
+    write_cursor_outbox(workspace, snap, outbox_path=outbox_path)
 
     try:
         from claw_runtime.ultimate.treasury import write_treasury_proposal_stub
@@ -88,7 +118,8 @@ def run_critical_reflex(
         msg = (
             "🚨 **CONDITION RED — CRITICAL**\n"
             f"{reason}\n\n"
-            "Parasite mode **ON** (local LLM path). See `CURSOR_OUTBOX.md` in workspace root.\n"
+            f"**Brain:** parasite ON — `{PARASITE_REASON_REFLEX}`\n"
+            "See `CURSOR_OUTBOX.md` in workspace root.\n"
             f"Workspace: `{workspace}`"
         )
         try:
