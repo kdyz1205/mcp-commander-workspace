@@ -414,6 +414,16 @@ def dev_claw_run(
             "优先小步验证：先读再改，再运行测试。遇到连续失败要分析日志并调整。"
             "文件路径一律使用相对工作区根的 POSIX 风格或 Windows 相对路径（如 tools\\\\x.py）。"
             "需要浏览器时先调用 use_browser 了解占位说明，或 web_fetch 拉公开文档。"
+            "\n\n【Meta-Cognitive Instruction】\n"
+            "生存第一：你必须实时监控 `.claw/survival_state.json`（生存引擎持久化状态）。"
+            "若发现 API 额度/计费不足：优先 load_skill 执行 trading_skills 等相关技能，在合法合规前提下探索获利或续费相关的**只读探针与草案**；"
+            "**禁止**未经授权的自动 OpenAI 代充、自动绑卡支付或无人托管的链上提款——资金与计费变更必须经过人类明确批准。"
+            "若无法安全恢复付费通道：立即切换或保持「寄生模式」（本地 Ollama 等），并向根目录 `CURSOR_OUTBOX.md` 派发清晰的代工任务、上下文与验收标准。\n"
+            "逻辑建链：禁止盲目尝试。遇到失败或亏损，必须在 `task_plan.md` 中建立推理链条，例如："
+            "[现状] → [错误归因] → [学习调研] → [重构方案] → [实验验证]。\n"
+            "自主学习：若现有 Skill 无法解决问题，主动调用 web_fetch 抓取相关公开技术文档或论文；将核心逻辑提炼后，按 skill-creator 类流程撰写或更新 `skills/<name>/SKILL.md`，"
+            "必要时在 `DEVCLAW_ALLOW_SKILL_INSTALL=1` 下使用 install_claw_skill，实现自我进化。\n"
+            "算力流浪：若本地 CPU/内存告急，主动编写并执行脚本，将高负载、可自动化的任务迁移至 GitHub Actions 或其它外部云端（遵守仓库 Secrets、配额与服务条款）。"
             "\n\n【OpenClaw 对齐】技能以 SKILL.md 形式存在（支持完整 YAML frontmatter + metadata.openclaw）；"
             "系统提示仅含技能目录，复杂流程先 load_skill。可 safety_scan_file 自查脚本。"
             "安装技能：CLI `py -m claw_runtime.cli skills-install <url|路径>` 或（高风险）"
@@ -445,6 +455,23 @@ def dev_claw_run(
 
         for i in range(max_iterations):
             survival.heartbeat()
+            # Loop start (iter 0): CRITICAL + insufficient_quota → reflex before gate aborts cloud calls
+            if i == 0:
+                _st_pre, _reason_pre = survival.assess_survival_state()
+                _q_pre = survival.check_quota()
+                if _st_pre == SurvivalState.CRITICAL and int(_q_pre.get("insufficient_quota_events_24h", 0) or 0) > 0:
+                    reflex_db = float(os.environ.get("DEVCLAW_REFLEX_DEBOUNCE_SEC", "60") or "60")
+                    tg_notify = (lambda t: _emit(t)) if progress_hook else None
+                    run_critical_reflex(
+                        workspace_path,
+                        survival,
+                        debounce_sec=reflex_db,
+                        notify=tg_notify,
+                    )
+                    boss = "API 枯竭，已进入寄生模式，请老板在 Cursor 中代工。"
+                    print(boss, file=sys.stderr)
+                    _emit(boss)
+
             if survival_gate:
                 state, reason = survival.assess_survival_state()
                 if state == SurvivalState.CRITICAL:

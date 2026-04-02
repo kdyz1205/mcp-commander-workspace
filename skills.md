@@ -18,7 +18,8 @@
 | 生存反射 + 寄生 | `claw_runtime/survival_reflex.py` + `tg_dev_claw.py` 后台线程 | CRITICAL 时写根目录 `CURSOR_OUTBOX.md`、TG 广播、`set_parasite_mode`；`/parasite_off` 清除 | 与 `SURVIVAL_TICK_SEC` / `SURVIVAL_REFLEX_DEBOUNCE_SEC` 配合 |
 | 意识路由 | `claw_runtime/consciousness_router.py` | TG 文本合并进 `system_append`；`TG_CONSCIOUSNESS_ROUTER=0` 关闭 | 轻量关键词路由，非云端大模型 |
 | 夜间进化草稿 | `claw_runtime/nightly_evolution.py` | `py -m claw_runtime.cli --workspace . evolve-draft` 或 TG `/evolve` | 从 `.claw/evolution_failures.jsonl` 生成 `skills/auto_evolve_*` |
-| 交易技能（可插拔） | `skills/trading_*` + `tools/trading_funding_binance.py` | `load_skill` 名见各 SKILL frontmatter | 重逻辑见 [claude-tg-bot/trading_skills](https://github.com/kdyz1205/claude-tg-bot/tree/master/trading_skills) |
+| 交易 / 生存维系 | `skills/trading/` + `tools/trading_funding_binance.py` | `load_skill trading`；上游 `trading/` 拷至 `skills/trading/scripts/` | 重逻辑见 claude-tg-bot；**人工托管**资金与计费 |
+| 交易技能（可插拔） | `skills/trading_*` + `tools/trading_funding_binance.py` | `load_skill` 名见各 SKILL frontmatter | DEX 脉冲、费率等薄封装 |
 | Ultimate 四维度（合规骨架） | `claw_runtime/ultimate/` + `ultimate-*` CLI | `load_skill ultimate_capabilities` | Colab 包、冷存+TG、自备代理轮换、nomad 快照+GHA 样例、子进程 mesh、技能杂交、venv 自愈脚本、只读 ETH 探测；**不**含自动 MEV/批量注册账号/黑产代理 |
 | 元驱动 autonomous_tick | `claw_runtime/meta_driving.py` | `py dev_claw\\main.py --autonomous --tick-sec 120` 或 `py -m claw_runtime.cli autonomous-tick` | 无用户指令周期性自检；`load_skill meta_driving` / `proxy_rotator` |
 | 进化大脑 / 推理闭环 | `claw_runtime/reasoning_episode.py` + `skills/evolution_brain` | `append_reasoning_episode` 或 `META_REASONING_EPISODE=1` + `autonomous_tick` | 假设→验证→修正写入 `task_plan.md`；**不**含自动提款/代充 |

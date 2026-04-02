@@ -4,6 +4,8 @@ description: WHEN operating the "digital life" meta loop — use autonomous_tick
 metadata: {"openclaw":{"always":false}}
 ---
 
+完整四层架构（生存 / 元认知 / 寄生 / 技能变异）见 **`docs/META_EVOLUTION_ARCHITECTURE.md`**。
+
 ## 运行入口
 
 - **单次**：`py -m claw_runtime.cli --workspace . autonomous-tick`

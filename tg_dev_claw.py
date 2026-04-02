@@ -14,6 +14,7 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
   SURVIVAL_TICK_SEC — 后台生存检查间隔（默认 60）
   SURVIVAL_REFLEX_DEBOUNCE_SEC — CRITICAL 时仅 TG/ treasury 去抖；CURSOR_OUTBOX 每轮 CRITICAL 仍会刷新
   TG_IDLE_AUTOTICK — 设为 1 时，空闲时每 TG_IDLE_AUTOTICK_SEC（默认 1800）跑一轮自检 DevClaw
+  TG_AUTONOMOUS_LOGIC_CHAIN — 设为 1 时，每 TG_LOGIC_CHAIN_SEC（默认 1800）在队列空闲时跑「逻辑链」自检 DevClaw
   TG_AUTONOMOUS_LIFE — 设为 1 启用「自主心跳」后台循环（默认关闭，避免意外耗 API）
   AUTONOMOUS_LIFE_TICK_SEC — 自主心跳间隔秒（默认 600）
   TG_AUTONOMOUS_TRADING — 设为 1 且在交易时间窗内会跑行情类 DevClaw 任务
@@ -253,15 +254,39 @@ def main() -> int:
         """
         生存脉冲：CRITICAL 时 **必须** 走 `run_critical_reflex`（始终刷新 CURSOR_OUTBOX + 寄生；
         debounce 只限制 TG 广播与 treasury 重复写入，不阻止 OUTBOX）。
+        附带：`autonomous_fund_check` 写入持久队列；每 tick 尝试将 1 条持久任务喂入 TG 队列（worker 空闲时）。
         """
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         tick = int(os.environ.get("SURVIVAL_TICK_SEC", "60") or "60")
         debounce = float(os.environ.get("SURVIVAL_REFLEX_DEBOUNCE_SEC", "300") or "300")
+        try:
+            admin_chats_hb = sorted(int(x) for x in admins)
+            primary_chat_hb = admin_chats_hb[0]
+        except ValueError:
+            primary_chat_hb = None
         time.sleep(min(tick, 5))
         while True:
             try:
                 eng = SurvivalEngine(ws_path)
                 eng.heartbeat()
+                try:
+                    fund_note = eng.autonomous_fund_check()
+                    if fund_note:
+                        _broadcast_admins(
+                            "[生存引擎] 低资金估算 — 已写入 .claw/persisted_tasks.jsonl\n" + fund_note[:500],
+                        )
+                except Exception:
+                    pass
+                if primary_chat_hb is not None and not worker_busy.is_set():
+                    try:
+                        from claw_runtime.bot_task_queue import pop_persisted_tasks
+
+                        for item in pop_persisted_tasks(ws_path, max_n=1):
+                            t = (item.get("text") or "").strip()
+                            if t:
+                                task_q.put((primary_chat_hb, t))
+                    except Exception:
+                        pass
                 st, _reason = eng.assess_survival_state()
                 if st == SurvivalState.CRITICAL:
                     run_critical_reflex(
@@ -327,6 +352,64 @@ def main() -> int:
                     pass
 
     threading.Thread(target=idle_autotick_loop, daemon=True, name="idle-autotick").start()
+
+    def autonomous_logic_chain_loop() -> None:
+        """
+        每 TG_LOGIC_CHAIN_SEC（默认 1800）且 in-memory 队列为空时，发起一轮「逻辑链」DevClaw：
+        交易回顾、公开 Alpha 检索摘要、策略与 task_plan 对齐。不替代持久队列投递。
+        """
+        if not _env_truthy("TG_AUTONOMOUS_LOGIC_CHAIN"):
+            return
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        interval = max(300, int(os.environ.get("TG_LOGIC_CHAIN_SEC", "1800") or "1800"))
+        try:
+            admin_lc = sorted(int(x) for x in admins)
+        except ValueError:
+            return
+        if not admin_lc:
+            return
+        primary_chat = admin_lc[0]
+        chain_iters = int(os.environ.get("TG_LOGIC_CHAIN_MAX_ITERS", "14") or "14")
+        prompt = os.environ.get(
+            "TG_LOGIC_CHAIN_PROMPT",
+            "【自主逻辑链】定期自检。\n"
+            "1) 用仓库内已有日志/脚本检查近期交易或策略结果（无则明确说无数据，勿编造）。\n"
+            "2) web_fetch 拉取公开资讯做 Alpha/市场摘要（遵守 ToS，勿绕过登录墙）。\n"
+            "3) 若需改策略：在 task_plan.md 写 [现状]→[错误归因]→[学习调研]→[重构方案]→[实验验证]，再改代码。\n"
+            "禁止自动 API 代充、未授权推特抓取、违法内容。",
+        )
+        time.sleep(min(interval, 90))
+        while True:
+            time.sleep(interval)
+            try:
+                if worker_busy.is_set():
+                    continue
+                try:
+                    if task_q.unfinished_tasks > 0 or task_q.qsize() > 0:
+                        continue
+                except Exception:
+                    pass
+
+                def _chain_hook(msg: str) -> None:
+                    try:
+                        _send_chunks(bot, primary_chat, f"[逻辑链]\n{msg}")
+                    except Exception:
+                        pass
+
+                merged = _merged_system_append(prompt) or system_append
+                dev_claw_run(
+                    prompt,
+                    max_iterations=chain_iters,
+                    system_append=merged,
+                    progress_hook=_chain_hook,
+                )
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _broadcast_admins(f"[逻辑链异常] {e!s}"[:TG_CHUNK])
+                except Exception:
+                    pass
+
+    threading.Thread(target=autonomous_logic_chain_loop, daemon=True, name="logic-chain").start()
 
     def autonomous_life_loop() -> None:
         """
@@ -558,7 +641,8 @@ def main() -> int:
             f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
             f"最大迭代: {max_iters}\n"
             f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n"
-            f"空闲自检: {'开 (TG_IDLE_AUTOTICK=1)' if _env_truthy('TG_IDLE_AUTOTICK') else '关'}\n\n"
+            f"空闲自检: {'开 (TG_IDLE_AUTOTICK=1)' if _env_truthy('TG_IDLE_AUTOTICK') else '关'}\n"
+            f"逻辑链: {'开 (TG_AUTONOMOUS_LOGIC_CHAIN=1)' if _env_truthy('TG_AUTONOMOUS_LOGIC_CHAIN') else '关'}\n\n"
             "直接发普通文字（不以 / 开头）会入队交给 DevClaw 执行。",
         )
 

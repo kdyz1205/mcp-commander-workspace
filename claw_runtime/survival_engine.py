@@ -3,8 +3,9 @@ Survival engine — distilled from claude-tg-bot vital_signs + tracker/quota ide
 
 - check_vitals(): host CPU / RAM / disk (psutil if installed, else disk-only).
 - check_quota(): persisted OpenAI-style failures + optional soft budget counters.
+- hunger_signals(): metaphorical "starvation" flags (billing, soft budget, no key, task streak).
 - assess_survival_state(): HEALTHY | DEGRADED | CRITICAL for downstream hooks
-  (future: parasite mode, CURSOR_OUTBOX, TG alerts).
+  (parasite mode, CURSOR_OUTBOX, TG alerts — see survival_reflex / meta_driving).
 
 State file: <workspace>/.claw/survival_state.json
 """
@@ -39,6 +40,29 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "").strip() or default)
     except ValueError:
         return default
+
+
+def read_fund_estimate_usd(workspace: Path) -> float | None:
+    """
+    Optional operating budget signal (not OpenAI billing — that uses insufficient_quota events).
+    Set SURVIVAL_FUND_BALANCE_USD or write `.claw/fund_estimate.json` {\"usd\": 12.34}.
+    """
+    env = os.environ.get("SURVIVAL_FUND_BALANCE_USD", "").strip()
+    if env:
+        try:
+            return float(env)
+        except ValueError:
+            pass
+    p = Path(workspace).resolve() / ".claw" / "fund_estimate.json"
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and "usd" in data:
+            return float(data["usd"])
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
 
 
 @dataclass
@@ -150,6 +174,22 @@ class SurvivalEngine:
             "last_heartbeat_ts": st.get("last_heartbeat_ts"),
         }
 
+    def hunger_signals(self) -> dict[str, Any]:
+        """
+        Physiological metaphor for downstream UX / logs: "starved" when paid API path is unusable
+        or task pain is high. Does not move money; triggers are wired in survival_reflex / DevClaw.
+        """
+        q = self.check_quota()
+        fails = self.consecutive_failures()
+        thr = max(1, _env_int("SURVIVAL_HUNGER_FAIL_STREAK", 3))
+        return {
+            "billing_starved": q["insufficient_quota_events_24h"] > 0,
+            "soft_budget_starved": bool(q["soft_budget_exhausted"]),
+            "no_cloud_key": not q["openai_key_configured"],
+            "task_pain_streak": fails,
+            "task_pain_elevated": fails >= thr,
+        }
+
     def assess_survival_state(self) -> tuple[SurvivalState, str]:
         """
         CRITICAL: host or API survival threatened — caller should stop paid work / enter parasite mode.
@@ -226,6 +266,7 @@ class SurvivalEngine:
             "reason": reason,
             "vitals": v,
             "quota": q,
+            "hunger": self.hunger_signals(),
             "consecutive_failures": self.consecutive_failures(),
             "parasite_active": self.parasite_active(),
         }
@@ -301,3 +342,46 @@ class SurvivalEngine:
             st["last_critical_reflex_ts"] = now
             self._save_state(st)
             return True
+
+    def autonomous_fund_check(self) -> str | None:
+        """
+        If fund estimate is below SURVIVAL_FUND_LOW_USD (default 5), enqueue a persisted task for
+        the TG worker / human loop. Does **not** move money or call top-up APIs.
+
+        Returns the task text if enqueued, else None.
+        """
+        if os.environ.get("SURVIVAL_AUTONOMOUS_FUND_CHECK", "").strip().lower() in {"0", "false", "no"}:
+            return None
+        threshold = _env_float("SURVIVAL_FUND_LOW_USD", 5.0)
+        debounce = _env_float("SURVIVAL_FUND_TASK_DEBOUNCE_SEC", 3600.0)
+        usd = read_fund_estimate_usd(self.workspace)
+        if usd is None:
+            return None
+        if usd >= threshold:
+            return None
+        now = time.time()
+        with self._lock:
+            st = self._load_state()
+            last = float(st.get("last_fund_autonomy_ts", 0) or 0)
+            if now - last < debounce:
+                return None
+            st["last_fund_autonomy_ts"] = now
+            self._save_state(st)
+
+        text = (
+            "【生存维系 · 队列任务】运营资金估算低于阈值（见 .claw/fund_estimate.json 或 SURVIVAL_FUND_BALANCE_USD）。"
+            "请 load_skill trading，在**人工批准**与合规边界内评估策略；仅允许只读/模拟/已授权操作。"
+            "严禁自动 OpenAI 代充或无人托管链上出金。若存在套利或续费方案，写入 task_plan.md 推理链并等待老板确认。"
+        )
+        try:
+            from claw_runtime.bot_task_queue import enqueue_persisted_task
+
+            enqueue_persisted_task(
+                self.workspace,
+                "fund_low_autonomy",
+                text,
+                {"usd": usd, "threshold_usd": threshold},
+            )
+        except Exception:
+            return None
+        return text

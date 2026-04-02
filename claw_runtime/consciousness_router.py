@@ -55,10 +55,10 @@ def route_message(text: str) -> RouteDecision:
     return RouteDecision(
         "trading",
         (
-            "【意识路由 — 交易/数据猎食】优先 load_skill：trading_dex_pulse、"
+            "【意识路由 — 交易/数据猎食】优先 load_skill：trading（生存/策略总览）、trading_dex_pulse、"
             "trading_funding_public、trading_correlation_note；需要公开 HTTP 时用 web_fetch；"
             "需要自然语言行情摘要可 execute_terminal 调用 `py tools\\\\web_agent.py \"...\"`。"
-            "不做非法爬取、不提供内幕或保证收益。"
+            "不做非法爬取、不提供内幕或保证收益；资金与计费须人工托管。"
         ),
-        ("trading_dex_pulse", "trading_funding_public"),
+        ("trading", "trading_dex_pulse", "trading_funding_public"),
     )

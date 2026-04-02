@@ -18,6 +18,12 @@ build/
 # Local agent state (memory, session logs)
 .claw/
 
+# Temp clone helper (do not commit)
+.tmp-claude-tg-bot/
+
+# Vendored trading runtime state (under skills/trading/scripts/)
+skills/trading/scripts/agent_state.json
+
 # Workspace artifacts
 screen_context.png
 

@@ -46,6 +46,9 @@ def autonomous_tick(workspace: Path | str) -> dict[str, Any]:
     actions: list[dict[str, Any]] = []
     eng = SurvivalEngine(ws)
     eng.heartbeat()
+    fund_note = eng.autonomous_fund_check()
+    if fund_note:
+        actions.append({"name": "fund_low_persisted_task", "detail": fund_note[:240]})
 
     state, reason = eng.assess_survival_state()
     q = eng.check_quota()

@@ -16,6 +16,13 @@
       "notes": "需 OPENAI_API_KEY；cwd/写文件均在 DEVCLAW_WORKSPACE 或 --bot-root；高风险 shell 命令由人工审。"
     },
     {
+      "id": "trading",
+      "title": "交易/生存维系技能（迁移 claude-tg-bot trading）",
+      "path": "skills/trading/SKILL.md",
+      "invoke": "load_skill trading",
+      "notes": "将上游 trading/ 拷至 skills/trading/scripts/；资金与计费须人工托管。"
+    },
+    {
       "id": "trading_dex_pulse",
       "title": "DEX / 自然语言行情脉冲",
       "path": "skills/trading_dex_pulse/SKILL.md",
