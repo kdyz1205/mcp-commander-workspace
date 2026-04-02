@@ -27,6 +27,7 @@ except ImportError:
     raise SystemExit(1) from None
 
 from claw_runtime.memory import append_memory
+from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
 from claw_runtime.session_log import log_tool
 from claw_runtime.skill_registry import SkillRegistry
 
@@ -44,9 +45,32 @@ WEB_FETCH_MAX = int(os.environ.get("DEVCLAW_WEB_FETCH_MAX", "1500000"))
 
 
 def execute_terminal(command: str) -> str:
-    """Run a shell command (cwd = workspace). High privilege: review commands carefully."""
+    """Run a shell command (cwd = workspace). Optional Docker sandbox via env or claw.config.json."""
     root = _workspace_root()
     print(f"\n[terminal] {command}")
+    ws_path = Path(root)
+    use_dock, image, net = docker_enabled(ws_path)
+    if use_dock:
+        try:
+            cp = run_shell_in_docker(
+                root,
+                command,
+                image=image,
+                network=net,
+                timeout=TERMINAL_TIMEOUT,
+            )
+            out = (cp.stdout or "") + (cp.stderr or "")
+            if not out.strip():
+                out = "(docker: no output, exit code %s)" % cp.returncode
+            print(f"[docker terminal preview]\n{out[:400]}...\n" if len(out) > 400 else out)
+            return out[:MAX_TOOL_CHARS]
+        except FileNotFoundError:
+            return "Docker 不可用（未安装或不在 PATH）。请关闭 sandbox 或安装 Docker Desktop。"
+        except subprocess.TimeoutExpired:
+            return f"Docker 执行超时（>{TERMINAL_TIMEOUT}s）"
+        except Exception as e:  # noqa: BLE001
+            return f"Docker 执行报错: {e!s}"
+
     try:
         result = subprocess.run(
             command,
@@ -122,6 +146,22 @@ def use_browser_stub(task_prompt: str) -> str:
         "或 pip install browser-use 后自行接入。任务描述：\n"
         + (task_prompt or "")[:2000]
     )
+
+
+def safety_scan_relative_file(filepath: str) -> str:
+    from claw_runtime.safety_scan import scan_path
+
+    root = Path(_workspace_root()).resolve()
+    p = (root / filepath).resolve()
+    if not str(p).startswith(str(root) + os.sep) and p != root:
+        return "拒绝：路径必须在工作区内"
+    if not p.is_file():
+        return f"不是文件: {filepath}"
+    findings = scan_path(p)
+    if not findings:
+        return "safety_scan: 未发现规则命中（仍不代表绝对安全）。"
+    lines = [f"[{f.severity.value}] {f.rule_id}: {f.message}" for f in findings]
+    return "\n".join(lines)
 
 
 def load_skill_body(registry: SkillRegistry, skill_name: str) -> str:
@@ -215,6 +255,34 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "safety_scan_file",
+            "description": "对工作区内文件跑危险模式扫描（curl|sh、fork bomb、rm -rf / 等）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"filepath": {"type": "string", "description": "相对工作区根"}},
+                "required": ["filepath"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "install_claw_skill",
+            "description": "从 URL(zip) 或本地路径安装技能到 skills/<name>/。需环境变量 DEVCLAW_ALLOW_SKILL_INSTALL=1。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "skill_name": {"type": "string", "description": "可选，覆盖文件夹名"},
+                    "skip_safety": {"type": "boolean", "description": "true 跳过安装前扫描（危险）"},
+                },
+                "required": ["source"],
+            },
+        },
+    },
 ]
 
 
@@ -282,8 +350,12 @@ def dev_claw_run(
         "优先小步验证：先读再改，再运行测试。遇到连续失败要分析日志并调整。"
         "文件路径一律使用相对工作区根的 POSIX 风格或 Windows 相对路径（如 tools\\\\x.py）。"
         "需要浏览器时先调用 use_browser 了解占位说明，或 web_fetch 拉公开文档。"
-        "\n\n【OpenClaw 对齐】技能以 SKILL.md 形式存在；系统提示仅含技能目录，"
-        "执行前对复杂流程请 load_skill 读取全文。新建技能放入 ./skills/<name>/SKILL.md 会在下一轮自动生效（热重载）。"
+        "\n\n【OpenClaw 对齐】技能以 SKILL.md 形式存在（支持完整 YAML frontmatter + metadata.openclaw）；"
+        "系统提示仅含技能目录，复杂流程先 load_skill。可 safety_scan_file 自查脚本。"
+        "安装技能：CLI `py -m claw_runtime.cli skills-install <url|路径>` 或（高风险）"
+        "DEVCLAW_ALLOW_SKILL_INSTALL=1 后调用 install_claw_skill。"
+        "终端可在 Docker 内执行：claw.config.json sandbox.docker.enabled 或 DEVCLAW_USE_DOCKER_SANDBOX=1。"
+        "多阶段编排：py -m claw_runtime.cli multi-agent …"
     )
     if system_append:
         base_core = base_core + "\n\n" + system_append.strip()
@@ -347,6 +419,27 @@ def dev_claw_run(
                     args.get("category", "fact"),
                     args.get("text", ""),
                 )
+            elif name == "safety_scan_file":
+                tool_result = safety_scan_relative_file(args.get("filepath", ""))
+            elif name == "install_claw_skill":
+                if os.environ.get("DEVCLAW_ALLOW_SKILL_INSTALL", "").strip().lower() not in {
+                    "1",
+                    "true",
+                    "yes",
+                }:
+                    tool_result = (
+                        "拒绝：安装技能需设置环境变量 DEVCLAW_ALLOW_SKILL_INSTALL=1 "
+                        "（也可用 CLI：py -m claw_runtime.cli skills-install …）。"
+                    )
+                else:
+                    from claw_runtime.skill_installer import install_skill
+
+                    tool_result = install_skill(
+                        workspace_path,
+                        args.get("source", ""),
+                        target_name=(args.get("skill_name") or "").strip() or None,
+                        skip_safety=bool(args.get("skip_safety")),
+                    )
             else:
                 tool_result = f"未知工具: {name}"
 

@@ -1,26 +1,20 @@
 """
-Skill precedence (aligned with OpenClaw docs.openclaw.ai/skills):
+Skill precedence (OpenClaw docs.openclaw.ai/skills), extended with plugin skill dirs:
 
-Highest → Lowest for same `name`:
-  workspace ./skills
-  workspace ./.agents/skills
-  user ~/.agents/skills
-  user ~/.openclaw/skills
-  bundled claw_runtime/bundled_skills
-  extra dirs from claw.config.json skills.load.extraDirs
-
-We hot-reload every agent iteration (stronger than default session snapshot).
+Low → High merge (later wins on same name):
+  extraDirs → plugin skill dirs → bundled → ~/.openclaw/skills → ~/.agents/skills
+  → <workspace>/.agents/skills → <workspace>/skills
 """
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Iterable
 
+from claw_runtime.config_load import load_claw_config
+from claw_runtime.plugin_loader import plugin_skill_dirs
 from claw_runtime.skill_loader import SkillRecord, discover_under
 
 
@@ -28,12 +22,18 @@ def _home() -> Path:
     return Path(os.path.expanduser("~"))
 
 
-def _workspace_skills_dirs(workspace: Path, extra_dirs: list[str]) -> list[tuple[int, Path]]:
-    """Return (precedence_rank, path). Lower rank = lower priority (applied first)."""
+def _workspace_skills_dirs(
+    workspace: Path,
+    extra_dirs: list[str],
+    plugin_dirs: list[Path],
+) -> list[tuple[int, Path]]:
     ranked: list[tuple[int, Path]] = []
     rank = 0
     for d in extra_dirs:
         ranked.append((rank, Path(d).expanduser().resolve()))
+        rank += 1
+    for pd in plugin_dirs:
+        ranked.append((rank, pd.resolve()))
         rank += 1
     bundled = Path(__file__).resolve().parent / "bundled_skills"
     ranked.append((rank, bundled))
@@ -48,22 +48,12 @@ def _workspace_skills_dirs(workspace: Path, extra_dirs: list[str]) -> list[tuple
     return ranked
 
 
-def _load_config(workspace: Path) -> dict:
-    p = workspace / "claw.config.json"
-    if not p.is_file():
-        return {}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-
-
 def _extra_dirs(cfg: dict, workspace: Path) -> list[str]:
     try:
         raw = cfg.get("skills", {}).get("load", {}).get("extraDirs", [])
         out: list[str] = []
         for item in raw:
-            p = Path(item)
+            p = Path(str(item))
             if not p.is_absolute():
                 p = workspace / p
             out.append(str(p))
@@ -74,6 +64,21 @@ def _extra_dirs(cfg: dict, workspace: Path) -> list[str]:
 
 def _which(cmd: str) -> bool:
     return shutil.which(cmd) is not None
+
+
+def _normalize_os_list(oss: list[str]) -> set[str]:
+    out: set[str] = set()
+    for o in oss:
+        o = str(o).lower().strip()
+        if o in ("macos", "darwin"):
+            out.add("darwin")
+        elif o in ("win32", "windows"):
+            out.add("win32")
+        elif o == "linux":
+            out.add("linux")
+        else:
+            out.add(o)
+    return out
 
 
 def _eligible(rec: SkillRecord) -> bool:
@@ -103,7 +108,8 @@ def _eligible(rec: SkillRecord) -> bool:
         plat = sys.platform
         map_ = {"win32": "win32", "darwin": "darwin", "linux": "linux"}
         cur = map_.get(plat, plat)
-        if cur not in oss:
+        allowed = _normalize_os_list([str(x) for x in oss])
+        if cur not in allowed and plat not in allowed:
             return False
     return True
 
@@ -111,12 +117,13 @@ def _eligible(rec: SkillRecord) -> bool:
 class SkillRegistry:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace.resolve()
-        self._cfg = _load_config(self.workspace)
+        self._cfg = load_claw_config(self.workspace)
 
     def refresh(self) -> dict[str, SkillRecord]:
         extra = _extra_dirs(self._cfg, self.workspace)
+        plug = plugin_skill_dirs(self.workspace)
         merged: dict[str, SkillRecord] = {}
-        for _rank, root in _workspace_skills_dirs(self.workspace, extra):
+        for _rank, root in _workspace_skills_dirs(self.workspace, extra, plug):
             for rec in discover_under(root):
                 if not _eligible(rec):
                     continue
@@ -130,7 +137,7 @@ class SkillRegistry:
         lines = [
             "## Skills (OpenClaw-style, progressive disclosure)",
             "Only names + descriptions here. To load full steps, call tool `load_skill` with exact `name`.",
-            "New skills under `./skills/` override bundled and home dirs on name conflict.",
+            "Plugin skills → `plugins/*/skills/` via `claw.config.json`; `py -m claw_runtime.cli skills install <url>`.",
             "",
         ]
         for name in sorted(skills.keys()):

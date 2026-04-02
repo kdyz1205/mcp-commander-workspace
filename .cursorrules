@@ -45,11 +45,15 @@
 
 ### OpenClaw 底层逻辑（本仓库对齐 + 超越）
 
-- **技能模型**：与 [OpenClaw Skills](https://docs.openclaw.ai/skills/) / AgentSkills 一致 — 每个技能为 `SKILL.md`（frontmatter：`name`、`description`，可选单行 `metadata` JSON 门禁）。
-- **加载顺序（低到高覆盖）**：`claw.config.json` → `skills.load.extraDirs` → **`claw_runtime/bundled_skills`** → `~/.openclaw/skills` → `~/.agents/skills` → **`<workspace>/.agents/skills`** → **`<workspace>/skills`**（同名后者赢）。
-- **渐进式披露**：`dev_claw` 系统提示只注入技能**目录**；模型应通过工具 **`load_skill`** 拉取全文（对齐 OpenClaw 省 token 策略）。
-- **热重载**：每个工具循环开始重扫技能目录；新建 `skills/<name>/SKILL.md` **无需重启**即可出现在目录中（比仅依赖 session snapshot 更激进，利于 meta-skill）。
-- **超越点**：内置 **`web_fetch`**（公开文档/HTML/JSON）、**分型 `append_typed_memory`**（`.claw/memory/`）、**`.claw/sessions/*.jsonl` 工具审计**；可选 `metadata.openclaw.requires` 的 bins/env/os **简易门禁**（未实现安装器与 ClawHub 同步）。
+- **技能模型**：与 [OpenClaw Skills](https://docs.openclaw.ai/skills/) / [ClawHub skill-format](https://github.com/openclaw/clawhub/blob/main/docs/skill-format.md) 一致 — `SKILL.md` 支持 **完整 YAML frontmatter**（含嵌套 `metadata.openclaw`，别名 `clawdbot`/`clawdis` 会归一化）；需 `pip` 安装 **PyYAML**（见 `dev_claw/requirements.txt`）。
+- **加载顺序（低到高覆盖）**：`skills.load.extraDirs` → **`plugins/*/skills/`（见 `claw.config.json` `plugins.entries` + `openclaw.plugin.json`）** → **`claw_runtime/bundled_skills`** → `~/.openclaw/skills` → `~/.agents/skills` → **`<workspace>/.agents/skills`** → **`<workspace>/skills`**（同名后者赢）。
+- **渐进式披露**：`dev_claw` 系统提示只注入技能**目录**；复杂流程用 **`load_skill`** 拉全文。
+- **热重载**：每个工具循环重扫技能目录（利于 meta-skill）。
+- **ClawHub 式安装**：`py -m claw_runtime.cli skills-install <zip URL 或本地路径>`；写入 **`.clawhub/lock.json`**；安装前 **`safety_scan`**（`claw.config.json` → `safety`）。对话内安装需 **`DEVCLAW_ALLOW_SKILL_INSTALL=1`** 且工具 **`install_claw_skill`**。
+- **危险代码扫描**：工具 **`safety_scan_file`** + CLI **`safety-scan`**（启发式规则，非网关级 AST；**不能**等价 OpenClaw 内置扫描器全覆盖）。
+- **Docker 沙箱（可选）**：`sandbox.docker.enabled` 或 **`DEVCLAW_USE_DOCKER_SANDBOX=1`**，`execute_terminal` 在容器内 `sh -c`（需本机 Docker；Windows 用 Docker Desktop）。
+- **多 Agent 编排（轻量）**：`py -m claw_runtime.cli multi-agent "…"` 顺序跑规划→实施→审计（三次 `dev_claw_run`，非真正多进程网关）。
+- **仍未用 Node 复刻**：无 OpenClaw **Gateway**、**ClawHub 官方 `/api/v1/download` 客户端**、**插件市场热更新**、**企业沙箱策略**；若要对齐官方栈需并行跑 OpenClaw 或继续扩 Python。
 
 ## Crypto / 行情 / Smart Money — 强制工作流（写代码前必须先拉真实数据）
 

@@ -4,6 +4,28 @@
       "extraDirs": [],
       "watch": true,
       "watchDebounceMs": 250
+    },
+    "clawhub": {
+      "baseUrl": "https://clawhub.com",
+      "note": "Use CLI: py -m claw_runtime.cli skills-install <zip-or-repo-archive-url>"
+    }
+  },
+  "plugins": {
+    "entries": [
+      { "path": "plugins/demo", "enabled": true }
+    ]
+  },
+  "safety": {
+    "scanSkillsOnInstall": true,
+    "blockCritical": true,
+    "blockHigh": false,
+    "scanSkillBodyOnLoad": false
+  },
+  "sandbox": {
+    "docker": {
+      "enabled": false,
+      "image": "python:3.12-slim",
+      "network": "none"
     }
   }
 }

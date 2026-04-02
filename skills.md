@@ -12,7 +12,8 @@
 | 雇佣数字工程师 | `digital_engineer/hire.py` | `py digital_engineer\hire.py --bot-root <路径> "任务"` | OpenClaw 式本地循环，需 OPENAI_API_KEY |
 | TG 遥控 DevClaw | `tg_dev_claw.py` | `py tg_dev_claw.py` + 环境变量见 `env.example` | 手机发指令，本机跑工具循环并回推进度 |
 | DevClaw 裸循环 | `dev_claw/main.py` | `py dev_claw\main.py --workspace <路径> "任务"` | 通用终端+写文件；含 OpenClaw 式 SKILL 热重载 |
-| OpenClaw 运行时 | `claw_runtime/` + `skills/*/SKILL.md` | `load_skill` / `claw.config.json` | 渐进披露、门禁、`.claw/memory`、sessions 日志 |
+| OpenClaw 运行时 | `claw_runtime/` + `skills/*/SKILL.md` | `load_skill` / `claw.config.json` | YAML frontmatter、插件 skills、安装/扫描/多 Agent CLI |
+| Claw CLI | `python -m claw_runtime.cli` | `skills-install` / `safety-scan` / `plugins-list` / `multi-agent` | 见 `--workspace` |
 
 ## 登记规范
 
