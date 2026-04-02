@@ -8,6 +8,17 @@ import sys
 from pathlib import Path
 
 
+def _ensure_utf8_stdio() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
 def cmd_skills_install(args: argparse.Namespace) -> int:
     ws = Path(args.workspace).resolve()
     os.environ.setdefault("DEVCLAW_WORKSPACE", str(ws))
@@ -187,6 +198,95 @@ def cmd_autonomous_loop(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_loopback_run(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from claw_runtime.loopback import run_loopback_instruction
+
+    ws = Path(args.workspace).resolve()
+    text = " ".join(args.text).strip() or "请做一轮离线自治自检。"
+    out = run_loopback_instruction(ws, text, max_iterations=args.max_iters)
+    print(
+        _json.dumps(
+            {
+                "instruction": out.instruction,
+                "success": out.success,
+                "message_count": len(out.messages),
+                "messages": out.messages,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0 if out.success else 1
+
+
+def cmd_production_self_test(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from claw_runtime.self_test import run_production_self_test
+
+    ws = Path(args.workspace).resolve()
+    report = run_production_self_test(ws)
+    print(_json.dumps(report, indent=2, ensure_ascii=False))
+    return 0 if report.get("passed") else 1
+
+
+def cmd_control_panel(args: argparse.Namespace) -> int:
+    from claw_runtime.runtime_control import ensure_runtime_control, panel_summary, runtime_control_path
+
+    ws = Path(args.workspace).resolve()
+    state = ensure_runtime_control(ws)
+    print(panel_summary(state))
+    print(runtime_control_path(ws))
+    return 0
+
+
+def cmd_control_set(args: argparse.Namespace) -> int:
+    from claw_runtime.runtime_control import update_runtime_control
+
+    ws = Path(args.workspace).resolve()
+    changes: dict[str, object] = {}
+    notes: list[str] = []
+    if args.pause:
+        changes["accepting_tasks"] = False
+        changes["background_master_enabled"] = False
+        notes.append("Paused intake and background autonomy.")
+    if args.resume:
+        changes["accepting_tasks"] = True
+        changes["background_master_enabled"] = True
+        notes.append("Resumed intake and background autonomy.")
+    if args.background == "on":
+        changes["background_master_enabled"] = True
+        notes.append("Background autonomy enabled.")
+    elif args.background == "off":
+        changes["background_master_enabled"] = False
+        notes.append("Background autonomy disabled.")
+    if args.trading_mode:
+        changes["trading_mode"] = args.trading_mode
+        if args.trading_mode != "live":
+            changes["live_trading_enabled"] = False
+        notes.append(f"Trading mode set to {args.trading_mode}.")
+    if args.disable_live_trading:
+        changes["live_trading_enabled"] = False
+        changes["manual_trading_approval_required"] = True
+        notes.append("Live trading disabled.")
+    if not changes:
+        print("No changes requested.", file=sys.stderr)
+        return 1
+    state = update_runtime_control(
+        ws,
+        actor="cli",
+        source_text="control-set",
+        note=" ".join(notes) or "Updated from CLI.",
+        **changes,
+    )
+    from claw_runtime.runtime_control import panel_summary
+
+    print(panel_summary(state))
+    return 0
+
+
 def cmd_ultimate_status(args: argparse.Namespace) -> int:
     keys = [
         "NOMAD_REGISTER_HANDLERS",
@@ -217,6 +317,7 @@ def cmd_multi(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    _ensure_utf8_stdio()
     p = argparse.ArgumentParser(
         prog="claw",
         description="DevClaw / OpenClaw-style Python CLI",
@@ -298,6 +399,30 @@ def main() -> int:
     al = sub.add_parser("autonomous-loop", help="Run meta-driving loop until Ctrl+C")
     al.add_argument("--interval", type=float, default=120.0, help="Seconds between ticks (min 15)")
     al.set_defaults(func=cmd_autonomous_loop)
+
+    lb = sub.add_parser("loopback-run", help="Run one self-message instruction through DevClaw locally")
+    lb.add_argument("text", nargs="*", help="Instruction text")
+    lb.add_argument("--max-iters", type=int, default=8, help="Max DevClaw iterations")
+    lb.set_defaults(func=cmd_loopback_run)
+
+    pst = sub.add_parser("production-self-test", help="Run four-dimension production self-test")
+    pst.set_defaults(func=cmd_production_self_test)
+
+    cpanel = sub.add_parser("control-panel", help="Show runtime control panel state")
+    cpanel.set_defaults(func=cmd_control_panel)
+
+    cset = sub.add_parser("control-set", help="Update runtime control panel state")
+    cset.add_argument("--pause", action="store_true", help="Pause new tasks and background autonomy")
+    cset.add_argument("--resume", action="store_true", help="Resume new tasks and background autonomy")
+    cset.add_argument("--background", choices=("on", "off"), default=None, help="Explicitly toggle background autonomy")
+    cset.add_argument(
+        "--trading-mode",
+        choices=("simulation", "disabled", "manual_review"),
+        default=None,
+        help="Trading mode; live mode is intentionally unavailable here",
+    )
+    cset.add_argument("--disable-live-trading", action="store_true", help="Hard-disable live trading")
+    cset.set_defaults(func=cmd_control_set)
 
     args = p.parse_args()
     return int(args.func(args))

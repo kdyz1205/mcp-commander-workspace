@@ -26,6 +26,10 @@ skills/trading/scripts/agent_state.json
 
 # Workspace artifacts
 screen_context.png
+CURSOR_OUTBOX.md
+scripts/self_heal_rebuild_venv.ps1
+scripts/self_heal_rebuild_venv.sh
+skills/survival_hybrid/
 
 # OS / IDE
 Thumbs.db

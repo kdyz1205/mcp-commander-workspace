@@ -59,6 +59,16 @@ except ImportError:
 
 from claw_runtime.consciousness_router import route_message
 from claw_runtime.nightly_evolution import append_evolution_failure
+from claw_runtime.runtime_control import (
+    allows_autonomous_life,
+    allows_idle_autotick,
+    allows_logic_chain,
+    ensure_runtime_control,
+    interpret_control_message,
+    load_runtime_control,
+    panel_summary,
+    update_runtime_control,
+)
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 from claw_runtime.survival_reflex import run_critical_reflex
 from dev_claw.main import dev_claw_run
@@ -117,6 +127,10 @@ def _register_bot_commands(bot: telebot.TeleBot) -> None:
         types.BotCommand("whoami", "查看本聊天 ID（配置 TG_ADMIN_CHAT_IDS）"),
         types.BotCommand("ping", "存活检测"),
         types.BotCommand("status", "队列与工作区状态"),
+        types.BotCommand("panel", "运行控制面板"),
+        types.BotCommand("pause", "暂停接任务和自主循环"),
+        types.BotCommand("resume", "恢复接任务和自主循环"),
+        types.BotCommand("sim", "锁定 simulation only"),
         types.BotCommand("cancel", "取消说明（单 worker 版）"),
         types.BotCommand("vitals", "生存引擎快照（心跳/配额/寄生）"),
         types.BotCommand("parasite_off", "关闭寄生模式标记"),
@@ -200,6 +214,8 @@ def main() -> int:
         os.environ["DEVCLAW_WORKSPACE"] = os.path.abspath(ws)
     else:
         os.environ.setdefault("DEVCLAW_WORKSPACE", _REPO_ROOT)
+    ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+    ensure_runtime_control(ws_path)
 
     bot = telebot.TeleBot(token, parse_mode=None)
     task_q: queue.Queue[tuple[int, str]] = queue.Queue()
@@ -210,10 +226,22 @@ def main() -> int:
     _register_bot_commands(bot)
 
     def worker() -> None:
-        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         while True:
             chat_id, instruction = task_q.get()
             worker_busy.set()
+            pause_notice_sent = False
+            while not _control_state().accepting_tasks:
+                if not pause_notice_sent:
+                    try:
+                        _send_chunks(
+                            bot,
+                            chat_id,
+                            "收到暂停指令，当前任务已挂起，等待你发送“开始干活”或 /resume 再继续。",
+                        )
+                    except Exception:
+                        pass
+                    pause_notice_sent = True
+                time.sleep(2)
             merged = _merged_system_append(instruction) or system_append
             try:
 
@@ -252,6 +280,15 @@ def main() -> int:
             except Exception:
                 pass
 
+    def _control_state():
+        return load_runtime_control(ws_path)
+
+    def _control_panel_text() -> str:
+        return (
+            panel_summary(_control_state())
+            + "\n- 说明: 自然语言可直接说“开始干活”“暂停”“只模拟交易”“控制面板”。"
+        )
+
     def survival_heartbeat_loop() -> None:
         """
         生存脉冲：CRITICAL 时 **必须** 走 `run_critical_reflex`（始终刷新 CURSOR_OUTBOX + 寄生；
@@ -271,15 +308,17 @@ def main() -> int:
             try:
                 eng = SurvivalEngine(ws_path)
                 eng.heartbeat()
-                try:
-                    fund_note = eng.autonomous_fund_check()
-                    if fund_note:
-                        _broadcast_admins(
-                            "[生存引擎] 低资金估算 — 已写入 .claw/persisted_tasks.jsonl\n" + fund_note[:500],
-                        )
-                except Exception:
-                    pass
-                if primary_chat_hb is not None and not worker_busy.is_set():
+                control = _control_state()
+                if control.background_master_enabled:
+                    try:
+                        fund_note = eng.autonomous_fund_check()
+                        if fund_note:
+                            _broadcast_admins(
+                                "[生存引擎] 低资金估算 — 已写入 .claw/persisted_tasks.jsonl\n" + fund_note[:500],
+                            )
+                    except Exception:
+                        pass
+                if primary_chat_hb is not None and control.accepting_tasks and control.background_master_enabled and not worker_busy.is_set():
                     try:
                         from claw_runtime.bot_task_queue import pop_persisted_tasks
 
@@ -326,6 +365,8 @@ def main() -> int:
         while True:
             time.sleep(interval)
             try:
+                if not allows_idle_autotick(_control_state()):
+                    continue
                 if worker_busy.is_set():
                     continue
                 try:
@@ -384,6 +425,8 @@ def main() -> int:
         while True:
             time.sleep(interval)
             try:
+                if not allows_logic_chain(_control_state()):
+                    continue
                 if worker_busy.is_set():
                     continue
                 try:
@@ -435,6 +478,8 @@ def main() -> int:
         while True:
             time.sleep(interval)
             try:
+                if not allows_autonomous_life(_control_state()):
+                    continue
                 if worker_busy.is_set():
                     continue
                 try:
@@ -560,14 +605,74 @@ def main() -> int:
             qn = task_q.qsize()
         except Exception:
             qn = -1
+        control = _control_state()
         bot.reply_to(
             message,
             "DevClaw 状态\n"
             f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
             f"队列中任务数: {qn}\n"
             f"最大迭代: {max_iters}\n"
-            "说明: 单 worker 串行处理，上一条跑完才处理下一条。",
+            f"忙碌中: {'是' if worker_busy.is_set() else '否'}\n\n"
+            + panel_summary(control)
+            + "\n\n说明: 单 worker 串行处理，上一条跑完才处理下一条。",
         )
+
+    @bot.message_handler(commands=["panel"])
+    def cmd_panel(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        bot.reply_to(message, _control_panel_text())
+
+    @bot.message_handler(commands=["pause"])
+    def cmd_pause(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        state = update_runtime_control(
+            ws_path,
+            actor=f"tg:{message.chat.id}",
+            source_text="/pause",
+            note="Paused intake and background autonomy from Telegram command.",
+            accepting_tasks=False,
+            background_master_enabled=False,
+        )
+        bot.reply_to(message, "已暂停。\n\n" + panel_summary(state))
+
+    @bot.message_handler(commands=["resume"])
+    def cmd_resume(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        state = update_runtime_control(
+            ws_path,
+            actor=f"tg:{message.chat.id}",
+            source_text="/resume",
+            note="Resumed intake and background autonomy from Telegram command.",
+            accepting_tasks=True,
+            background_master_enabled=True,
+        )
+        bot.reply_to(message, "已恢复开工。\n\n" + panel_summary(state))
+
+    @bot.message_handler(commands=["sim"])
+    def cmd_sim(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        state = update_runtime_control(
+            ws_path,
+            actor=f"tg:{message.chat.id}",
+            source_text="/sim",
+            note="Trading hard-limited to simulation only from Telegram command.",
+            trading_mode="simulation",
+            live_trading_enabled=False,
+            manual_trading_approval_required=True,
+        )
+        bot.reply_to(message, "已锁定为 simulation only。\n\n" + panel_summary(state))
 
     @bot.message_handler(commands=["vitals"])
     def cmd_vitals(message: telebot.types.Message) -> None:
@@ -575,7 +680,6 @@ def main() -> int:
         if not _is_admin(cid, admins):
             bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
             return
-        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         eng = SurvivalEngine(ws_path)
         eng.heartbeat()
         snap = eng.snapshot()
@@ -588,7 +692,6 @@ def main() -> int:
         if not _is_admin(cid, admins):
             bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
             return
-        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         SurvivalEngine(ws_path).set_parasite_mode(False)
         bot.reply_to(message, "已关闭寄生模式标记（.claw/parasite_mode.json 已清除）。可 unset DEVCLAW_PARASITE_MODE。")
 
@@ -600,7 +703,6 @@ def main() -> int:
             return
         from claw_runtime.nightly_evolution import materialize_draft_skill
 
-        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         out = materialize_draft_skill(ws_path)
         if out:
             bot.reply_to(message, f"已生成草稿技能:\n`{out}`\n请人工审阅 SKILL.md。", parse_mode=None)
@@ -638,6 +740,10 @@ def main() -> int:
             "/whoami — 查看 chat_id\n"
             "/ping — 在线检测\n"
             "/status — 队列与工作区\n"
+            "/panel — 控制面板\n"
+            "/pause — 暂停接任务和自主循环\n"
+            "/resume — 恢复接任务和自主循环\n"
+            "/sim — 锁定 simulation only\n"
             "/cancel — 取消说明\n"
             "/vitals — 生存引擎快照\n"
             "/parasite_off — 关闭寄生模式\n"
@@ -647,7 +753,8 @@ def main() -> int:
             f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n"
             f"空闲自检: {'开 (TG_IDLE_AUTOTICK=1)' if _env_truthy('TG_IDLE_AUTOTICK') else '关'}\n"
             f"逻辑链: {'开 (TG_AUTONOMOUS_LOGIC_CHAIN=1)' if _env_truthy('TG_AUTONOMOUS_LOGIC_CHAIN') else '关'}\n\n"
-            "直接发普通文字（不以 / 开头）会入队交给 DevClaw 执行。",
+            "自然语言也能控：例如“开始干活，检查一下仓库”“暂停”“只模拟交易”“控制面板”。\n\n"
+            + _control_panel_text(),
         )
 
     @bot.message_handler(
@@ -665,6 +772,19 @@ def main() -> int:
         text = (message.text or "").strip()
         if not text:
             return
+        control_outcome = interpret_control_message(ws_path, text, actor=f"tg:{message.chat.id}")
+        if control_outcome is not None:
+            bot.reply_to(message, control_outcome.reply)
+            if control_outcome.queue_instruction:
+                task_q.put((message.chat.id, control_outcome.queue_instruction))
+            return
+        control = _control_state()
+        if not control.accepting_tasks:
+            bot.reply_to(
+                message,
+                "当前处于暂停/静默状态，暂不接新任务。发送“开始干活”或 /resume 可恢复。\n\n" + panel_summary(control),
+            )
+            return
         bot.reply_to(message, "已入队，DevClaw 开始处理…")
         task_q.put((message.chat.id, text))
 
@@ -679,6 +799,7 @@ def main() -> int:
 
     print("TG DevClaw 监听中… 工作区:", os.environ.get("DEVCLAW_WORKSPACE"))
     print("管理员 chat id:", ", ".join(sorted(admins)))
+    _broadcast_admins("DevClaw 已启动。\n\n" + _control_panel_text())
     bot.infinity_polling(skip_pending=True, interval=1, timeout=60)
     return 0
 

@@ -27,4 +27,6 @@ if (-not $env:TG_BOT_TOKEN -or -not $env:TG_ADMIN_CHAT_IDS -or -not $env:OPENAI_
 }
 
 py -m pip install -q -r requirements-telegram.txt
+py -m claw_runtime.cli --workspace . control-set --trading-mode simulation --disable-live-trading
+py -m claw_runtime.cli --workspace . control-panel
 py tg_dev_claw.py

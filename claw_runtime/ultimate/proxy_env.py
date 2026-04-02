@@ -32,6 +32,28 @@ def proxy_env_for_index(proxies: list[str], index: int) -> dict[str, str]:
     return {"HTTP_PROXY": url, "HTTPS_PROXY": url, "ALL_PROXY": url}
 
 
+def current_proxy_env(workspace: Path | str) -> dict[str, str]:
+    workspace = Path(workspace).resolve()
+    state_path = workspace / ".claw" / "proxy_rotate.json"
+    if not state_path.is_file():
+        return {}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    proxy = str(data.get("proxy", "")).strip()
+    if not proxy:
+        return {}
+    return {"HTTP_PROXY": proxy, "HTTPS_PROXY": proxy, "ALL_PROXY": proxy}
+
+
+def apply_proxy_env(workspace: Path | str) -> dict[str, str]:
+    env_map = current_proxy_env(workspace)
+    for key, value in env_map.items():
+        os.environ[key] = value
+    return env_map
+
+
 def rotate_proxy_index(workspace: Path) -> dict[str, Any]:
     """
     Persist next index in .claw/proxy_rotate.json; optionally run VPN_SWITCH_CMD between hops.
@@ -62,4 +84,7 @@ def rotate_proxy_index(workspace: Path) -> dict[str, Any]:
         except (OSError, subprocess.TimeoutExpired):
             pass
 
-    return {"ok": True, "index": idx, "proxy": proxies[idx], "env_snippet": proxy_env_for_index(proxies, idx)}
+    env_map = proxy_env_for_index(proxies, idx)
+    for key, value in env_map.items():
+        os.environ[key] = value
+    return {"ok": True, "index": idx, "proxy": proxies[idx], "env_snippet": env_map}
