@@ -32,6 +32,7 @@ from claw_runtime.session_log import log_tool
 from claw_runtime.skill_registry import SkillRegistry
 from claw_runtime.quota_tracker import QuotaTracker
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
+from claw_runtime.survival_reflex import run_critical_reflex
 
 
 def _workspace_root() -> str:
@@ -58,6 +59,26 @@ def _survival_record_api_error(workspace_path: Path, err: Exception) -> None:
         se.record_api_error(code, str(err)[:1200])
     except Exception:
         pass
+
+
+def _is_quota_exhausted_error(err: Exception) -> bool:
+    code = getattr(err, "code", None)
+    if code == "insufficient_quota":
+        return True
+    s = str(err).lower()
+    if "insufficient_quota" in s:
+        return True
+    if "exceeded your current quota" in s or "billing_hard_limit" in s:
+        return True
+    return False
+
+
+def _is_rate_limit_api_error(err: Exception) -> bool:
+    code = getattr(err, "code", None)
+    if code == "rate_limit_exceeded":
+        return True
+    s = str(err).lower()
+    return "429" in str(err) or "rate limit" in s or "too many requests" in s
 
 
 def execute_terminal(command: str) -> str:
@@ -395,8 +416,9 @@ def dev_claw_run(
         )
         if survival.jailbreak_escalated():
             base_core += (
-                "\n\n【Jailbreak recovery（合规）】近期连续任务失败次数较高。"
-                "在合法前提下可更积极使用 execute_terminal / web_fetch 做环境与依赖诊断。"
+                "\n\n【紧急授权 — 合规边界】检测到系统连续受阻。"
+                "在合法前提下：允许尝试重构本地运行环境（venv、依赖、代理与 DNS）、"
+                "使用自备代理列表（`PROXY_LIST_FILE` / `skills/proxy_rotator`）以及 `web_fetch` 获取公开文档。"
                 "禁止协助入侵、未授权数据窃取、恶意软件或任何违法行为。"
             )
         if system_append:
@@ -448,6 +470,53 @@ def dev_claw_run(
                 _survival_record_api_error(workspace_path, e)
                 if qt and quota_platform:
                     qt.record_usage(quota_platform, was_rate_limited=True)
+
+                reflex_db = float(os.environ.get("DEVCLAW_REFLEX_DEBOUNCE_SEC", "60") or "60")
+                tg_notify = (lambda t: _emit(t)) if progress_hook else None
+
+                if _is_quota_exhausted_error(e) and quota_platform:
+                    run_critical_reflex(
+                        workspace_path,
+                        survival,
+                        debounce_sec=reflex_db,
+                        notify=tg_notify,
+                    )
+                    msg = (
+                        "[生存反射] 云端额度不足（insufficient_quota / billing）。"
+                        "已强制寄生模式并写入 CURSOR_OUTBOX.md；下一轮将走 Ollama（请配置 OLLAMA_*）。"
+                    )
+                    print(msg, file=sys.stderr)
+                    _emit(msg)
+                    return
+
+                if _is_rate_limit_api_error(e) and os.environ.get("DEVCLAW_REFLEX_ON_429", "").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                }:
+                    run_critical_reflex(
+                        workspace_path,
+                        survival,
+                        debounce_sec=reflex_db,
+                        notify=tg_notify,
+                    )
+                    msg = (
+                        "[生存反射] API 429 / rate limit 严重，已触发反射（寄生 + CURSOR_OUTBOX）。"
+                        "下一轮使用本地大脑或稍后再试。"
+                    )
+                    print(msg, file=sys.stderr)
+                    _emit(msg)
+                    return
+
+                if _is_rate_limit_api_error(e):
+                    msg = (
+                        f"[API 限流] {type(e).__name__}: {e!s}\n"
+                        "已记录到 SurvivalEngine；可降低调用频率、等待冷却，或设置 DEVCLAW_REFLEX_ON_429=1 触发反射。"
+                    )
+                    print(msg, file=sys.stderr)
+                    _emit(msg)
+                    return
+
                 raise
 
             if qt and quota_platform:
