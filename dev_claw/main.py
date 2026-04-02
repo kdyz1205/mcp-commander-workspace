@@ -347,6 +347,13 @@ def dev_claw_run(
     system_append: str | None = None,
     progress_hook: Callable[[str], None] | None = None,
 ) -> None:
+    """
+    Meta-cognition hooks (see also `claw_runtime/survival_reflex.py`):
+
+    - **Parasite:** `survival.parasite_active()` → Ollama-compatible `OpenAI` client + `OLLAMA_*`.
+    - **Quota API errors:** `insufficient_quota` → `run_critical_reflex` (OUTBOX + parasite), then return (no crash).
+    - **Jailbreak prompt:** `survival.jailbreak_escalated()` → extra system instructions after consecutive task failures.
+    """
     def _emit(text: str) -> None:
         if progress_hook:
             progress_hook(text)

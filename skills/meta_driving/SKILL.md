@@ -13,7 +13,7 @@ metadata: {"openclaw":{"always":false}}
 
 | 条件 | 动作 |
 |------|------|
-| CRITICAL | `run_critical_reflex`（与 TG 共享去抖） |
+| CRITICAL | `run_critical_reflex`（**OUTBOX+寄生每轮必刷新**；去抖仅 TG/treasury） |
 | DEGRADED + `META_COLAB_ON_DEGRADED=1` | `build_colab_job_bundle`（**手动**上传 Colab，无 Selenium 登录） |
 | 近 1h 有 rate 类错误 + `PROXY_LIST_FILE` | `rotate_proxy_index`（+ 可选 `VPN_SWITCH_CMD`） |
 | 24h 内 `insufficient_quota` | `treasury_proposal` + 可选只读 `trading_funding_binance.py` 子进程 |

@@ -266,11 +266,16 @@ class SurvivalEngine:
     # --- Task outcomes → jailbreak escalation (aligned with self_repair loops) ---
 
     def consecutive_failures(self) -> int:
+        """Persisted counter for jailbreak escalation (see `record_task_outcome`)."""
         with self._lock:
             st = self._load_state()
             return int(st.get("consecutive_failures", 0))
 
     def record_task_outcome(self, success: bool) -> None:
+        """
+        One DevClaw/TG **task run** outcome: success → reset counter to 0; failure → +1.
+        Used by `dev_claw_run` `finally` so jailbreak / system prompt escalation tracks real runs.
+        """
         with self._lock:
             st = self._load_state()
             if success:

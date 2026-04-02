@@ -12,7 +12,8 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
   TG_DEVCLAW_SYSTEM_APPEND — 可选，附加 system 提示
   TG_CONSCIOUSNESS_ROUTER — 默认 1；设为 0 关闭交易/工程关键词路由
   SURVIVAL_TICK_SEC — 后台生存检查间隔（默认 60）
-  SURVIVAL_REFLEX_DEBOUNCE_SEC — CRITICAL 时 TG/OUTBOX 去抖秒数（默认 300）
+  SURVIVAL_REFLEX_DEBOUNCE_SEC — CRITICAL 时仅 TG/ treasury 去抖；CURSOR_OUTBOX 每轮 CRITICAL 仍会刷新
+  TG_IDLE_AUTOTICK — 设为 1 时，空闲时每 TG_IDLE_AUTOTICK_SEC（默认 1800）跑一轮自检 DevClaw
   TG_AUTONOMOUS_LIFE — 设为 1 启用「自主心跳」后台循环（默认关闭，避免意外耗 API）
   AUTONOMOUS_LIFE_TICK_SEC — 自主心跳间隔秒（默认 600）
   TG_AUTONOMOUS_TRADING — 设为 1 且在交易时间窗内会跑行情类 DevClaw 任务
@@ -249,6 +250,10 @@ def main() -> int:
                 pass
 
     def survival_heartbeat_loop() -> None:
+        """
+        生存脉冲：CRITICAL 时 **必须** 走 `run_critical_reflex`（始终刷新 CURSOR_OUTBOX + 寄生；
+        debounce 只限制 TG 广播与 treasury 重复写入，不阻止 OUTBOX）。
+        """
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         tick = int(os.environ.get("SURVIVAL_TICK_SEC", "60") or "60")
         debounce = float(os.environ.get("SURVIVAL_REFLEX_DEBOUNCE_SEC", "300") or "300")
@@ -270,6 +275,58 @@ def main() -> int:
             time.sleep(max(15, tick))
 
     threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()
+
+    def idle_autotick_loop() -> None:
+        """空闲时每 30 分钟（可配置）跑一次轻量自检 DevClaw（与 full autonomous_life 独立）。"""
+        if not _env_truthy("TG_IDLE_AUTOTICK"):
+            return
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        interval = max(300, int(os.environ.get("TG_IDLE_AUTOTICK_SEC", "1800") or "1800"))
+        try:
+            admin_chats = sorted(int(x) for x in admins)
+        except ValueError:
+            admin_chats = []
+        if not admin_chats:
+            return
+        primary_chat = admin_chats[0]
+        tick_iters = int(os.environ.get("TG_IDLE_AUTOTICK_MAX_ITERS", "10") or "10")
+        prompt = os.environ.get(
+            "TG_IDLE_AUTOTICK_PROMPT",
+            "自检系统状态，如有优化空间请自主执行。",
+        )
+
+        time.sleep(min(interval, 60))
+        while True:
+            time.sleep(interval)
+            try:
+                if worker_busy.is_set():
+                    continue
+                try:
+                    if task_q.unfinished_tasks > 0 or task_q.qsize() > 0:
+                        continue
+                except Exception:
+                    pass
+
+                def _idle_hook(msg: str) -> None:
+                    try:
+                        _send_chunks(bot, primary_chat, f"[空闲自检]\n{msg}")
+                    except Exception:
+                        pass
+
+                merged = _merged_system_append(prompt) or system_append
+                dev_claw_run(
+                    prompt,
+                    max_iterations=tick_iters,
+                    system_append=merged,
+                    progress_hook=_idle_hook,
+                )
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _broadcast_admins(f"[空闲自检异常] {e!s}"[:TG_CHUNK])
+                except Exception:
+                    pass
+
+    threading.Thread(target=idle_autotick_loop, daemon=True, name="idle-autotick").start()
 
     def autonomous_life_loop() -> None:
         """
@@ -500,7 +557,8 @@ def main() -> int:
             "/evolve — 失败日志 → 草稿 SKILL\n\n"
             f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
             f"最大迭代: {max_iters}\n"
-            f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n\n"
+            f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n"
+            f"空闲自检: {'开 (TG_IDLE_AUTOTICK=1)' if _env_truthy('TG_IDLE_AUTOTICK') else '关'}\n\n"
             "直接发普通文字（不以 / 开头）会入队交给 DevClaw 执行。",
         )
 

@@ -1,7 +1,8 @@
 """
 CRITICAL survival reflex: downgrade brain (parasite / local Ollama) + CURSOR_OUTBOX.md + optional TG ping.
 
-Triggered by tg_dev_claw heartbeat (debounced) or manually. Policy-safe: no illegal actions.
+On every CRITICAL call, OUTBOX + parasite are **always** refreshed. Debounce applies only to
+treasury rewrite + TG notify (avoids spam while still guaranteeing Cursor sees fresh OUTBOX).
 """
 
 from __future__ import annotations
@@ -77,27 +78,27 @@ def run_critical_reflex(
     outbox_path: Path | None = None,
 ) -> bool:
     """
-    If state is CRITICAL and debounce allows:
-    1. Force parasite mode (local Ollama / OpenAI-compatible) — downgrade brain.
-    2. write_cursor_outbox — SOS for Cursor.
-    3. Treasury stub + optional TG notify.
+    When state is CRITICAL:
 
-    Returns True if reflex actions ran.
+    **Always (no debounce):** force parasite mode + refresh `CURSOR_OUTBOX.md` with latest snapshot.
+
+    **Debounced:** treasury stub + optional TG `notify` (so admins are not spammed every survival tick).
+
+    Returns True if state was CRITICAL (artifacts written); False if not CRITICAL.
     """
     workspace = Path(workspace).resolve()
     state, reason = engine.assess_survival_state()
     if state != SurvivalState.CRITICAL:
         return False
-    if not engine.try_acquire_critical_reflex_slot(debounce_sec):
-        return False
 
     snap = engine.snapshot()
 
-    # 1) 强制降级大脑 → 寄生 / 本地 Ollama（避免继续烧云端额度）
+    # 1–2) 每次 CRITICAL 都刷新：降级大脑 + 求救信（TG 心跳与 API 拦截均依赖此保证）
     engine.set_parasite_mode(True, PARASITE_REASON_REFLEX)
-
-    # 2) 求救信 → Cursor 协作
     write_cursor_outbox(workspace, snap, outbox_path=outbox_path)
+
+    if not engine.try_acquire_critical_reflex_slot(debounce_sec):
+        return True
 
     try:
         from claw_runtime.ultimate.treasury import write_treasury_proposal_stub
