@@ -25,4 +25,4 @@ screen_context.png
 Thumbs.db
 .DS_Store
 .idea/
-.vscode/
+# .vscode/ kept trackable so Explorer can show .env via workspace settings.json
