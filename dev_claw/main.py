@@ -567,9 +567,28 @@ def main() -> int:
         default=None,
         help="覆盖工作区根目录（等价于设置 DEVCLAW_WORKSPACE）",
     )
+    p.add_argument(
+        "--autonomous",
+        action="store_true",
+        help="元驱动模式：无用户指令，仅周期性 autonomous_tick（见 claw_runtime/meta_driving.py）",
+    )
+    p.add_argument(
+        "--tick-sec",
+        type=float,
+        default=120.0,
+        help="--autonomous 时 tick 间隔（秒），最小 15",
+    )
     args = p.parse_args()
     if args.workspace:
         os.environ["DEVCLAW_WORKSPACE"] = os.path.abspath(args.workspace)
+    if args.autonomous:
+        from pathlib import Path as _Path
+
+        from claw_runtime.meta_driving import run_autonomous_loop
+
+        root = _Path(_workspace_root())
+        run_autonomous_loop(root, args.tick_sec)
+        return 0
     text = " ".join(args.instruction).strip()
     if not text:
         text = (

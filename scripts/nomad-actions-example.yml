@@ -19,5 +19,7 @@ jobs:
           else
             echo "No snapshot"
           fi
-      - name: Placeholder — add your Colab export pull / notify / dry-run strategy here
-        run: echo "Replace this step with your compliant automation."
+      - name: Placeholder — e.g. dry-run DevClaw (needs secrets in repo Settings)
+        run: |
+          echo "Optional: pip install -r dev_claw/requirements.txt && py dev_claw/main.py --max-iters 1 'read nomad_snapshot and summarize'"
+          echo "Do NOT commit API keys; use GitHub Encrypted secrets + env in workflow."

@@ -20,6 +20,7 @@
 | 夜间进化草稿 | `claw_runtime/nightly_evolution.py` | `py -m claw_runtime.cli --workspace . evolve-draft` 或 TG `/evolve` | 从 `.claw/evolution_failures.jsonl` 生成 `skills/auto_evolve_*` |
 | 交易技能（可插拔） | `skills/trading_*` + `tools/trading_funding_binance.py` | `load_skill` 名见各 SKILL frontmatter | 重逻辑见 [claude-tg-bot/trading_skills](https://github.com/kdyz1205/claude-tg-bot/tree/master/trading_skills) |
 | Ultimate 四维度（合规骨架） | `claw_runtime/ultimate/` + `ultimate-*` CLI | `load_skill ultimate_capabilities` | Colab 包、冷存+TG、自备代理轮换、nomad 快照+GHA 样例、子进程 mesh、技能杂交、venv 自愈脚本、只读 ETH 探测；**不**含自动 MEV/批量注册账号/黑产代理 |
+| 元驱动 autonomous_tick | `claw_runtime/meta_driving.py` | `py dev_claw\\main.py --autonomous --tick-sec 120` 或 `py -m claw_runtime.cli autonomous-tick` | 无用户指令周期性自检；`load_skill meta_driving` / `proxy_rotator` |
 
 ## 登记规范
 

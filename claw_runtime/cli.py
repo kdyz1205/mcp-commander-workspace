@@ -168,6 +168,25 @@ def cmd_ultimate_treasury_probe(args: argparse.Namespace) -> int:
     return 0 if ok else 2
 
 
+def cmd_autonomous_tick(args: argparse.Namespace) -> int:
+    import json as _json
+
+    from claw_runtime.meta_driving import autonomous_tick
+
+    ws = Path(args.workspace).resolve()
+    out = autonomous_tick(ws)
+    print(_json.dumps({k: out[k] for k in ("ts", "state", "reason", "actions")}, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_autonomous_loop(args: argparse.Namespace) -> int:
+    from claw_runtime.meta_driving import run_autonomous_loop
+
+    ws = Path(args.workspace).resolve()
+    run_autonomous_loop(ws, float(args.interval))
+    return 0
+
+
 def cmd_ultimate_status(args: argparse.Namespace) -> int:
     keys = [
         "NOMAD_REGISTER_HANDLERS",
@@ -272,6 +291,13 @@ def main() -> int:
 
     ust = sub.add_parser("ultimate-status", help="Show ultimate-related env toggles")
     ust.set_defaults(func=cmd_ultimate_status)
+
+    at = sub.add_parser("autonomous-tick", help="Run one meta-driving autonomous_tick()")
+    at.set_defaults(func=cmd_autonomous_tick)
+
+    al = sub.add_parser("autonomous-loop", help="Run meta-driving loop until Ctrl+C")
+    al.add_argument("--interval", type=float, default=120.0, help="Seconds between ticks (min 15)")
+    al.set_defaults(func=cmd_autonomous_loop)
 
     args = p.parse_args()
     return int(args.func(args))

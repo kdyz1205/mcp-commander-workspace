@@ -42,6 +42,20 @@
       "path": "skills/ultimate_capabilities/SKILL.md",
       "invoke": "load_skill ultimate_capabilities",
       "notes": "Colab 手动上传、TG 冷存、代理列表、nomad、mesh、synthesis、treasury 只读。"
+    },
+    {
+      "id": "meta_driving",
+      "title": "元驱动 autonomous_tick（无用户指令循环）",
+      "path": "skills/meta_driving/SKILL.md",
+      "invoke": "py -m claw_runtime.cli --workspace . autonomous-tick",
+      "notes": "与 dev_claw --autonomous 同源；不自动 Selenium/代充。"
+    },
+    {
+      "id": "proxy_rotator",
+      "title": "自备代理/VPN 轮换",
+      "path": "skills/proxy_rotator/SKILL.md",
+      "invoke": "py skills\\\\proxy_rotator\\\\rotate.py",
+      "notes": "PROXY_LIST_FILE；可选 META_NETSH_CMD / VPN_SWITCH_CMD。"
     }
   ]
 }

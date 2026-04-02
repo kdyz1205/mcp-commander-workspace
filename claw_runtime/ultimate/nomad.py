@@ -43,13 +43,20 @@ def _git_push_snapshot(workspace: Path) -> None:
     if delay > 0:
         time.sleep(min(delay, 10.0))
     try:
+        add_args = ["git", "add", "-f", ".claw/nomad_snapshot.json"]
+        if os.environ.get("NOMAD_GIT_PUSH_SESSION_MEMORY", "").strip().lower() in {"1", "true", "yes"}:
+            # .claw/ is usually gitignored; -f forces session/memory artifacts for Actions resume
+            for rel in (".claw/sessions", ".claw/memory", ".claw/meta_tick_log.jsonl"):
+                p = workspace / rel
+                if p.exists():
+                    add_args.extend(["-f", rel])
         subprocess.run(
-            ["git", "add", "-f", ".claw/nomad_snapshot.json"],
+            add_args,
             cwd=str(workspace),
             check=False,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
         subprocess.run(
             ["git", "commit", "-m", "chore(nomad): survival snapshot (auto)"],
