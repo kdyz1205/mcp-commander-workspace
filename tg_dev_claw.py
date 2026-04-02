@@ -13,6 +13,10 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
   TG_CONSCIOUSNESS_ROUTER — 默认 1；设为 0 关闭交易/工程关键词路由
   SURVIVAL_TICK_SEC — 后台生存检查间隔（默认 60）
   SURVIVAL_REFLEX_DEBOUNCE_SEC — CRITICAL 时 TG/OUTBOX 去抖秒数（默认 300）
+  TG_AUTONOMOUS_LIFE — 设为 1 启用「自主心跳」后台循环（默认关闭，避免意外耗 API）
+  AUTONOMOUS_LIFE_TICK_SEC — 自主心跳间隔秒（默认 600）
+  TG_AUTONOMOUS_TRADING — 设为 1 且在交易时间窗内会跑行情类 DevClaw 任务
+  TG_TRADING_HOURS_UTC — 可选，如 9-17 或 9,10,22（UTC 小时）；留空则任意时刻
 
 运行（建议在本仓库根目录）:
   py tg_dev_claw.py
@@ -126,6 +130,54 @@ def _text_looks_like_command(text: str) -> bool:
     return len(t) >= 2 and t.startswith("/") and (len(t) == 1 or t[1].isalpha())
 
 
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _expand_workspace_paths_for_zip(workspace: Path, raw: str, *, max_files: int = 80) -> list[str]:
+    """Turn comma-separated rel paths into file list (directories expanded, capped)."""
+    ws = workspace.resolve()
+    out: list[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        p = (ws / part).resolve()
+        if not str(p).startswith(str(ws)):
+            continue
+        if p.is_file():
+            out.append(part.replace("\\", "/"))
+        elif p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file() and str(f).startswith(str(ws)):
+                    out.append(str(f.relative_to(ws)).replace("\\", "/"))
+                    if len(out) >= max_files:
+                        return out
+    return out
+
+
+def _is_trading_window_utc() -> bool:
+    if not _env_truthy("TG_AUTONOMOUS_TRADING"):
+        return False
+    raw = os.environ.get("TG_TRADING_HOURS_UTC", "").strip()
+    if not raw:
+        return True
+    h = time.gmtime().tm_hour
+    if "-" in raw and "," not in raw:
+        parts = raw.split("-", 1)
+        try:
+            lo, hi = int(parts[0].strip()), int(parts[1].strip())
+            return lo <= h <= hi
+        except ValueError:
+            return True
+    allowed: set[int] = set()
+    for x in raw.split(","):
+        x = x.strip()
+        if x.isdigit():
+            allowed.add(int(x) % 24)
+    return h in allowed if allowed else True
+
+
 def main() -> int:
     token = os.environ.get("TG_BOT_TOKEN", "").strip()
     admins = _admin_ids()
@@ -149,6 +201,7 @@ def main() -> int:
     task_q: queue.Queue[tuple[int, str]] = queue.Queue()
     max_iters = int(os.environ.get("TG_DEVCLAW_MAX_ITERS", str(_DEFAULT_ITERS)))
     system_append = os.environ.get("TG_DEVCLAW_SYSTEM_APPEND", "").strip() or None
+    worker_busy = threading.Event()
 
     _register_bot_commands(bot)
 
@@ -156,6 +209,7 @@ def main() -> int:
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         while True:
             chat_id, instruction = task_q.get()
+            worker_busy.set()
             merged = _merged_system_append(instruction) or system_append
             try:
 
@@ -182,6 +236,7 @@ def main() -> int:
                 except Exception:
                     pass
             finally:
+                worker_busy.clear()
                 task_q.task_done()
 
     threading.Thread(target=worker, daemon=True, name="devclaw-worker").start()
@@ -215,6 +270,107 @@ def main() -> int:
             time.sleep(max(15, tick))
 
     threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()
+
+    def autonomous_life_loop() -> None:
+        """
+        自主心跳：周期性自检；DEGRADED 且队列空闲时主动 DevClaw 清理/归档；交易时间窗内可跑行情摘要。
+        与 pyTelegramBotAPI 同步模型一致，使用线程而非 asyncio。
+        """
+        if not _env_truthy("TG_AUTONOMOUS_LIFE"):
+            return
+        ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
+        interval = max(60, int(os.environ.get("AUTONOMOUS_LIFE_TICK_SEC", "600") or "600"))
+        try:
+            admin_chats = sorted(int(x) for x in admins)
+        except ValueError:
+            admin_chats = []
+        if not admin_chats:
+            return
+        primary_chat = admin_chats[0]
+        auto_iters = int(os.environ.get("TG_AUTONOMOUS_MAX_ITERS", str(min(max_iters, 12))) or "12")
+
+        time.sleep(min(interval, 45))
+        while True:
+            time.sleep(interval)
+            try:
+                if worker_busy.is_set():
+                    continue
+                try:
+                    if task_q.unfinished_tasks > 0 or task_q.qsize() > 0:
+                        continue
+                except Exception:
+                    pass
+
+                eng = SurvivalEngine(ws_path)
+                eng.heartbeat()
+                st, reason = eng.assess_survival_state()
+
+                def _life_hook(msg: str) -> None:
+                    try:
+                        _send_chunks(bot, primary_chat, f"[自主心跳]\n{msg}")
+                    except Exception:
+                        pass
+
+                if st == SurvivalState.DEGRADED:
+                    if _env_truthy("TG_AUTONOMOUS_COLD_UPLOAD"):
+                        try:
+                            from claw_runtime.ultimate.storage_cold import (
+                                compress_paths,
+                                telegram_send_document_if_configured,
+                            )
+
+                            raw_paths = os.environ.get(
+                                "TG_AUTONOMOUS_COLD_PATHS",
+                                ".claw/sessions",
+                            )
+                            rels = _expand_workspace_paths_for_zip(ws_path, raw_paths)
+                            if not rels:
+                                raise OSError("no files matched TG_AUTONOMOUS_COLD_PATHS")
+                            z = compress_paths(ws_path, rels)
+                            ok, um = telegram_send_document_if_configured(z)
+                            if ok:
+                                _broadcast_admins(f"[自主心跳] 已冷归档上传 TG: {z.name}")
+                        except Exception as ez:  # noqa: BLE001
+                            _broadcast_admins(f"[自主心跳] 冷归档跳过: {ez!s}"[:500])
+
+                    prompt = os.environ.get(
+                        "TG_AUTONOMOUS_DEGRADED_PROMPT",
+                        "系统处于 DEGRADED（资源紧张）。请：1) 清理工作区内过大 .log / 临时文件；"
+                        "2) 归档或精简 `.claw/sessions` 下旧 jsonl；3) 必要时 `load_skill ultimate_capabilities` 查看冷存储/Colab 打包；"
+                        "不要删除 .env 或密钥。完成后简短汇报。",
+                    )
+                    merged = _merged_system_append(prompt) or system_append
+                    _broadcast_admins(f"[自主心跳] DEGRADED — 启动维护任务\n{reason[:300]}")
+                    dev_claw_run(
+                        prompt,
+                        max_iterations=auto_iters,
+                        system_append=merged,
+                        progress_hook=_life_hook,
+                    )
+
+                elif _is_trading_window_utc():
+                    prompt = os.environ.get(
+                        "TG_AUTONOMOUS_TRADING_PROMPT",
+                        "【自主行情扫视】load_skill trading_dex_pulse；或 execute_terminal 运行 "
+                        "`py tools\\\\web_agent.py \"crypto majors brief\"`；"
+                        "若有异常波动用 5 行内中文总结（非投资建议）。无 skill smart_money 时勿虚构链上聪明钱数据。",
+                    )
+                    merged = _merged_system_append(prompt) or system_append
+                    _broadcast_admins("[自主心跳] 交易时间窗 — 启动行情摘要任务")
+                    dev_claw_run(
+                        prompt,
+                        max_iterations=auto_iters,
+                        system_append=merged,
+                        progress_hook=_life_hook,
+                    )
+
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _broadcast_admins(f"[自主心跳异常] {e!s}"[:TG_CHUNK])
+                except Exception:
+                    pass
+
+    threading.Thread(target=autonomous_life_loop, daemon=True, name="autonomous-life").start()
 
     if os.environ.get("NOMAD_REGISTER_HANDLERS", "").strip().lower() in {"1", "true", "yes"}:
         from claw_runtime.ultimate.nomad import register_nomad_handlers
@@ -343,7 +499,8 @@ def main() -> int:
             "/parasite_off — 关闭寄生模式\n"
             "/evolve — 失败日志 → 草稿 SKILL\n\n"
             f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
-            f"最大迭代: {max_iters}\n\n"
+            f"最大迭代: {max_iters}\n"
+            f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n\n"
             "直接发普通文字（不以 / 开头）会入队交给 DevClaw 执行。",
         )
 
