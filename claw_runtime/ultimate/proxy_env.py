@@ -119,3 +119,62 @@ def rotate_proxy_index(workspace: Path) -> dict[str, Any]:
     for key, value in env_map.items():
         os.environ[key] = value
     return {"ok": True, "index": idx, "proxy": proxies[idx], "env_snippet": env_map}
+
+
+def test_proxy_health(proxy_url: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """Test if a proxy is working by making a simple request."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        handler = urllib.request.ProxyHandler({
+            "http": proxy_url,
+            "https": proxy_url,
+        })
+        opener = urllib.request.build_opener(handler)
+        req = urllib.request.Request(
+            "https://httpbin.org/ip",
+            headers={"User-Agent": "DevClaw-proxy-test/1.0"},
+        )
+        start = __import__("time").time()
+        with opener.open(req, timeout=timeout) as resp:
+            data = resp.read(1024).decode("utf-8", errors="replace")
+            elapsed = __import__("time").time() - start
+            return {"ok": True, "proxy": proxy_url, "latency_ms": round(elapsed * 1000), "response": data[:200]}
+    except Exception as exc:
+        return {"ok": False, "proxy": proxy_url, "error": str(exc)[:200]}
+
+
+def auto_rotate_on_failure(workspace: Path, *, max_attempts: int = 3) -> dict[str, Any]:
+    """
+    Auto-rotate through proxies until a working one is found.
+
+    Returns the first working proxy or error if all fail.
+    """
+    workspace = Path(workspace).resolve()
+    list_path = os.environ.get("PROXY_LIST_FILE", "").strip()
+    if not list_path:
+        return {"ok": False, "error": "PROXY_LIST_FILE not set"}
+    proxies = load_proxy_list(list_path)
+    if not proxies:
+        return {"ok": False, "error": "empty proxy list"}
+
+    for attempt in range(min(max_attempts, len(proxies))):
+        result = rotate_proxy_index(workspace)
+        if not result.get("ok"):
+            continue
+        proxy_url = result.get("proxy", "")
+        health = test_proxy_health(proxy_url, timeout=8.0)
+        if health.get("ok"):
+            return {
+                "ok": True,
+                "proxy": proxy_url,
+                "attempts": attempt + 1,
+                "latency_ms": health.get("latency_ms", 0),
+            }
+
+    return {
+        "ok": False,
+        "error": f"All {max_attempts} proxies failed health check",
+        "attempts": max_attempts,
+    }

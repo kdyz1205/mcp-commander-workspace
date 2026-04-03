@@ -191,6 +191,107 @@ def _git_push_snapshot(workspace: Path) -> None:
         pass
 
 
+def emergency_cold_backup(workspace: Path, *, notify: Callable[[str], None] | None = None) -> Path | None:
+    """
+    Emergency cold backup: zip critical state files and push to remote.
+
+    Called during CRITICAL survival state or before shutdown.
+    Preserves: memory, task queue, survival state, session logs, skills.
+    """
+    import zipfile
+
+    workspace = Path(workspace).resolve()
+    ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+    backup_dir = workspace / ".claw" / "cold_backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = backup_dir / f"emergency_backup_{ts}.zip"
+
+    critical_patterns = [
+        ".claw/survival_state.json",
+        ".claw/runtime_control.json",
+        ".claw/smart_task_registry.jsonl",
+        ".claw/persisted_tasks.jsonl",
+        ".claw/nomad_snapshot.json",
+        ".claw/nomad_environment.json",
+        ".claw/meta_tick_log.jsonl",
+        ".claw/evolution_failures.jsonl",
+        ".claw/quota_tracker.json",
+        ".claw/fund_estimate.json",
+    ]
+
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            # Add critical state files
+            for pattern in critical_patterns:
+                p = workspace / pattern
+                if p.is_file():
+                    zf.write(p, pattern)
+
+            # Add memory directory
+            mem_dir = workspace / ".claw" / "memory"
+            if mem_dir.is_dir():
+                for f in mem_dir.rglob("*.md"):
+                    rel = f.relative_to(workspace)
+                    zf.write(f, str(rel))
+
+            # Add latest session log
+            sessions_dir = workspace / ".claw" / "sessions"
+            if sessions_dir.is_dir():
+                session_files = sorted(sessions_dir.glob("*.jsonl"))
+                for sf in session_files[-3:]:  # last 3 days
+                    rel = sf.relative_to(workspace)
+                    zf.write(sf, str(rel))
+
+            # Add task_plan.md
+            tp = workspace / "task_plan.md"
+            if tp.is_file():
+                zf.write(tp, "task_plan.md")
+
+        if notify:
+            size_kb = zip_path.stat().st_size / 1024
+            notify(f"[Nomad] 紧急冷备份已创建: {zip_path.name} ({size_kb:.1f} KB)")
+
+        return zip_path
+
+    except Exception as exc:
+        if notify:
+            notify(f"[Nomad] 冷备份失败: {exc!s}")
+        return None
+
+
+def restore_from_cold_backup(workspace: Path, backup_path: Path) -> dict[str, Any]:
+    """
+    Restore state from a cold backup zip file.
+
+    Returns dict with restored file count and any errors.
+    """
+    import zipfile
+
+    workspace = Path(workspace).resolve()
+    restored = 0
+    errors: list[str] = []
+
+    try:
+        with zipfile.ZipFile(backup_path, "r") as zf:
+            for info in zf.infolist():
+                target = workspace / info.filename
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        dst.write(src.read())
+                    restored += 1
+                except OSError as e:
+                    errors.append(f"{info.filename}: {e!s}")
+    except Exception as exc:
+        errors.append(f"zip open failed: {exc!s}")
+
+    return {
+        "restored_files": restored,
+        "errors": errors,
+        "backup_path": str(backup_path),
+    }
+
+
 def register_nomad_handlers(workspace: Path, *, on_snapshot: Callable[[Path], None] | None = None) -> None:
     workspace = Path(workspace).resolve()
     lock = threading.Lock()
