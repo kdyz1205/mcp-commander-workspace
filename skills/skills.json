@@ -70,6 +70,20 @@
       "path": "skills/proxy_rotator/SKILL.md",
       "invoke": "py skills\\\\proxy_rotator\\\\rotate.py",
       "notes": "PROXY_LIST_FILE；可选 META_NETSH_CMD / VPN_SWITCH_CMD。"
+    },
+    {
+      "id": "profit_hunter",
+      "title": "Low-fund emergency arb scanner (funding rate, DEX arb)",
+      "path": "skills/profit_hunter/SKILL.md",
+      "invoke": "py skills\\\\profit_hunter\\\\runner.py --action hunger_scan --workspace . --balance 10",
+      "notes": "Read-only scanning; LIVE_TRADING=1 required for execution. Triggered by survival_engine fund_low."
+    },
+    {
+      "id": "treasury_ops",
+      "title": "Post-profit treasury management and burn rate tracking",
+      "path": "skills/treasury_ops/SKILL.md",
+      "invoke": "py skills\\\\treasury_ops\\\\runner.py --action dashboard --workspace .",
+      "notes": "Proposal-only; human approval required for transfers. Balances, burn rate, PnL, renewal proposals."
     }
   ]
 }

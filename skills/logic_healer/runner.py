@@ -116,6 +116,7 @@ _ERROR_PATTERNS: list[tuple[str, str, str]] = [
     (r"FileNotFoundError:\s*(.+?)(?:\n|$)", "FileNotFoundError", "Missing file or directory — path assumption incorrect."),
     (r"IndexError:\s*(.+?)(?:\n|$)", "IndexError", "Sequence index out of range — off-by-one or empty collection."),
     (r"SyntaxError:\s*(.+?)(?:\n|$)", "SyntaxError", "Malformed Python — broken edit, merge conflict marker, or encoding issue."),
+    (r"NameError:\s*name\s+'(\w+)'\s+is\s+not\s+defined", "NameError", "Undefined variable or function — missing import, typo, or out-of-scope reference."),
     (r"AssertionError", "AssertionError", "Test assertion failed — logic regression or stale expected value."),
     (r"TimeoutError|timed?\s*out", "TimeoutError", "Operation timed out — network, I/O, or compute bottleneck."),
     (r"ConnectionError|ConnectionRefused", "ConnectionError", "Network connection failure — service down, proxy, or firewall."),
@@ -183,6 +184,7 @@ def _suggest_strategy(error_type: str, combined_text: str) -> str:
         "FileNotFoundError": "Create the expected path or add an existence check with a fallback.",
         "IndexError": "Add bounds checking or handle the empty-collection case.",
         "SyntaxError": "Fix the syntax at the indicated line; check for merge conflict markers.",
+        "NameError": "Add the missing import, fix the typo, or move the definition before the reference.",
         "AssertionError": "Update the assertion's expected value or fix the logic that produces the actual.",
         "TimeoutError": "Increase timeout, add retry with backoff, or check the upstream service.",
         "ConnectionError": "Verify the endpoint is reachable; add retry logic or proxy configuration.",
@@ -275,6 +277,26 @@ def _add_pattern_suggestions(
         "SyntaxError": [
             "Run py_compile.compile() to pinpoint the exact line.",
             "Check for stray merge-conflict markers (<<<<<<<).",
+        ],
+        "NameError": [
+            "Add the missing import at the top of the file.",
+            "Check for typos in variable/function names.",
+        ],
+        "IndexError": [
+            "Add a length check before indexing (if seq: val = seq[0]).",
+            "Use try/except IndexError for optional access.",
+        ],
+        "ValueError": [
+            "Validate input before conversion (e.g. str.isdigit() before int()).",
+            "Use try/except ValueError with a meaningful fallback.",
+        ],
+        "TimeoutError": [
+            "Increase timeout or add exponential backoff retry.",
+            "Add a circuit-breaker pattern for repeated timeouts.",
+        ],
+        "ConnectionError": [
+            "Add retry logic with backoff (e.g. tenacity or manual loop).",
+            "Verify endpoint URL and network/proxy configuration.",
         ],
     }
     etype = error_analysis.get("error_type", "")

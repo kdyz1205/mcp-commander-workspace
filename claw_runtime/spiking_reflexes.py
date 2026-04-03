@@ -431,6 +431,44 @@ async def watch_file_changes(
         await asyncio.sleep(interval)
 
 
+async def watch_balance(
+    workspace: Path,
+    spike_queue: asyncio.Queue[Any],
+    threshold_usd: float = 100.0,
+    interval: float = 30.0,
+) -> None:
+    """
+    Poll .claw/fund_estimate.json periodically.
+
+    Fires a BalanceSpike when the reported USD balance drops below
+    *threshold_usd*.  Debounces to avoid repeated spikes within 5 minutes.
+    """
+    fund_path = workspace / ".claw" / "fund_estimate.json"
+    last_fired: float = 0.0
+    debounce_sec = 300.0  # 5 minutes
+
+    while True:
+        try:
+            if fund_path.is_file():
+                data = json.loads(fund_path.read_text(encoding="utf-8"))
+                current_usd = float(data.get("balance_usd", data.get("estimated_usd", 0.0)))
+                now = time.time()
+                if current_usd < threshold_usd and (now - last_fired) > debounce_sec:
+                    spike = BalanceSpike(
+                        current_usd=current_usd,
+                        threshold_usd=threshold_usd,
+                    )
+                    await spike_queue.put(spike)
+                    logger.warning("Balance spike: %s", spike)
+                    last_fired = now
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Balance watch poll error: %s", exc)
+
+        await asyncio.sleep(interval)
+
+
 # ---------------------------------------------------------------------------
 # System metrics helpers
 # ---------------------------------------------------------------------------
@@ -648,6 +686,17 @@ class SpikeDetector:
                 memory_threshold=mem_threshold,
             )
         ))
+
+        # Balance watchers
+        for bw in self._balance_watches:
+            tasks.append(asyncio.ensure_future(
+                watch_balance(
+                    workspace=self.workspace,
+                    spike_queue=spike_queue,
+                    threshold_usd=bw.threshold_usd,
+                    interval=30.0,
+                )
+            ))
 
         # Wait until stopped
         try:

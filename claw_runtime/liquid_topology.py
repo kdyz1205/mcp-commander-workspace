@@ -458,8 +458,45 @@ def _execute_topology(
             run_parallel_tasks,
         )
     except ImportError:
-        logger.error("subagent_mesh not available — cannot execute topology")
-        return [{"role": "system", "success": False, "summary": "subagent_mesh unavailable"}]
+        logger.warning(
+            "subagent_mesh not available — falling back to sequential "
+            "execution via dev_claw_run"
+        )
+
+        def run_parallel_tasks(
+            workspace: str,
+            task_specs: list[dict[str, Any]],
+            max_workers: int = 1,
+            timeout_sec: float = 600,
+            progress_hook: Callable[[str], None] | None = None,
+        ) -> list[dict[str, Any]]:
+            """Fallback: run tasks sequentially using dev_claw_run."""
+            results: list[dict[str, Any]] = []
+            for spec in task_specs:
+                t0 = time.time()
+                try:
+                    from dev_claw.main import dev_claw_run
+                    output = dev_claw_run(
+                        workspace=workspace,
+                        instruction=spec.get("instruction", ""),
+                    )
+                    results.append({
+                        "task_id": spec.get("task_id", ""),
+                        "role": spec.get("role", "unknown"),
+                        "success": True,
+                        "summary": str(output)[:500] if output else "",
+                        "elapsed_sec": round(time.time() - t0, 1),
+                    })
+                except Exception as exc:
+                    logger.warning("Fallback dev_claw_run failed for %s: %s", spec.get("role"), exc)
+                    results.append({
+                        "task_id": spec.get("task_id", ""),
+                        "role": spec.get("role", "unknown"),
+                        "success": False,
+                        "summary": f"fallback error: {exc}",
+                        "elapsed_sec": round(time.time() - t0, 1),
+                    })
+            return results
 
     ws_str = str(workspace)
 

@@ -305,8 +305,20 @@ def get_current_budget(workspace: Path) -> ComputeBudget:
     return budget
 
 
+_latency_cache: dict[str, Any] = {"value": 0.0, "timestamp": 0.0}
+_LATENCY_CACHE_TTL = 300.0  # 5 minutes
+
+
 def _probe_network_latency() -> float:
-    """Quick HTTP HEAD to a fast endpoint to measure network latency."""
+    """Quick HTTP HEAD to a fast endpoint to measure network latency.
+
+    Results are cached for 5 minutes to avoid hitting httpbin.org on every
+    budget check.
+    """
+    now = time.monotonic()
+    if now - _latency_cache["timestamp"] < _LATENCY_CACHE_TTL:
+        return _latency_cache["value"]
+
     import urllib.request
     import urllib.error
 
@@ -315,9 +327,13 @@ def _probe_network_latency() -> float:
         req = urllib.request.Request("https://httpbin.org/status/200", method="HEAD")
         with urllib.request.urlopen(req, timeout=5):
             pass
-        return round((time.monotonic() - t0) * 1000, 1)
+        result = round((time.monotonic() - t0) * 1000, 1)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
-        return 0.0
+        result = 0.0
+
+    _latency_cache["value"] = result
+    _latency_cache["timestamp"] = now
+    return result
 
 
 # ---------------------------------------------------------------------------

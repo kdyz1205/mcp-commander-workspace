@@ -242,18 +242,27 @@ def sign_action(workspace: Path, action_type: str, action_data: str) -> dict[str
     }
 
 
-def verify_signature(signed_action: dict[str, Any], public_key_hex: str) -> bool:
+def verify_signature(
+    signed_action: dict[str, Any],
+    public_key_hex: str,
+    workspace: Path | None = None,
+) -> bool:
     """Verify a signed action against the given public key.
 
-    Because the scheme uses HMAC (symmetric), true verification requires
-    the private key.  In our self-sovereign model the verifier either:
-      1. *is* the same agent (has the private key), or
-      2. trusts the public-key binding and checks structural consistency.
+    When *workspace* is provided and contains the private key corresponding
+    to *public_key_hex*, the function recomputes the HMAC-SHA256 signature
+    from the embedded timestamp + action_type + action_data and compares it
+    cryptographically.  If the private key is unavailable it falls back to
+    structural validation (required fields present, public key matches).
 
-    This function re-derives the expected HMAC when the private key is
-    available in memory (passed via the signed_action's embedded data) and
-    otherwise falls back to structural validation (fields present, hash
-    matches, public key matches).
+    Args:
+        signed_action: Dict produced by :func:`sign_action`.
+        public_key_hex: The expected public key hex string.
+        workspace: Optional workspace path to locate the private key for
+            full cryptographic verification.
+
+    Returns:
+        ``True`` if verification passes, ``False`` otherwise.
     """
     required = {"action_type", "timestamp", "data_hash", "signature", "public_key"}
     if not required.issubset(signed_action.keys()):
@@ -262,7 +271,40 @@ def verify_signature(signed_action: dict[str, Any], public_key_hex: str) -> bool
     if signed_action.get("public_key") != public_key_hex:
         return False
 
-    # Structural validation passes — the action was attributed to this key.
+    # --- Attempt full HMAC verification when the private key is available ---
+    private_key_bytes: bytes | None = None
+    if workspace is not None:
+        workspace = Path(workspace).resolve()
+        priv_path = _private_key_path(workspace)
+        pub_path = _public_key_path(workspace)
+        if priv_path.is_file() and pub_path.is_file():
+            try:
+                stored_pub = pub_path.read_text(encoding="utf-8").strip()
+                if stored_pub == public_key_hex:
+                    private_key_bytes = bytes.fromhex(
+                        priv_path.read_text(encoding="utf-8").strip()
+                    )
+            except (OSError, ValueError):
+                pass
+
+    if private_key_bytes is not None:
+        # Recompute expected signature: payload = timestamp + action_type + action_data
+        # We need the original action_data.  If 'action_data' is present use it;
+        # otherwise reconstruct from fields available in the signed record.
+        action_data = signed_action.get("action_data", "")
+        timestamp = signed_action["timestamp"]
+        action_type = signed_action["action_type"]
+        payload = f"{timestamp}{action_type}{action_data}"
+
+        expected_sig = hmac.new(
+            private_key_bytes,
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        return hmac.compare_digest(expected_sig, signed_action["signature"])
+
+    # --- Fallback: structural validation only (no private key available) ---
     return True
 
 
