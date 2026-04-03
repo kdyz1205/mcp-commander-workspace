@@ -371,7 +371,10 @@ def main() -> int:
                                         encoding="utf-8", errors="replace",
                                     )
                                     if _r.returncode == 0 and _r.stdout.strip():
-                                        _dispatch_reply(channel, chat_id, _r.stdout.strip()[:4000], request_id=request_id, kind="progress")
+                                        # Strip ANSI escape sequences from Ollama terminal output
+                                        import re as _re
+                                        _clean = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
+                                        _dispatch_reply(channel, chat_id, _clean[:4000], request_id=request_id, kind="progress")
                                         _answered = True
                                         break
                                 except (_sp.TimeoutExpired, FileNotFoundError):
