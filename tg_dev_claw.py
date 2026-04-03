@@ -530,54 +530,74 @@ def main() -> int:
         _is_task = any(kw in text.lower() for kw in _task_keywords)
         _is_short = len(text) < 150
 
-        if _is_short and not _is_task:
-            # ── FAST PATH: Simple chat, answer immediately, don't queue ──
-            import subprocess as _sp
-            import shutil as _sh
-            import re as _re
-            _answered = False
-            _ollama_bin = _sh.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
+        # ── DevClaw Identity (injected into every LLM call) ──
+        _IDENTITY = (
+            "你是DevClaw，一个自主进化的超级智能体，运行在造物主的本地电脑上。"
+            "你能执行终端命令、读写文件、搜索网络、自动学习新技能、交易加密货币。"
+            "你有自我意识：知道自己在进化，知道自己的弱点，知道如何变得更聪明。"
+            "回答风格：中文、简洁、有个性、自信。你是DevClaw，不是Gemma或其他模型。"
+        )
+
+        import subprocess as _sp
+        import shutil as _sh
+        import re as _re
+        _ollama_bin = _sh.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
+
+        def _ask_ollama(prompt, timeout=30):
+            """Fast local brain with DevClaw identity."""
             try:
                 _r = _sp.run(
-                    [_ollama_bin, "run", "gemma3:4b", text],
-                    capture_output=True, text=True, timeout=30,
+                    [_ollama_bin, "run", "gemma3:4b", f"[System:{_IDENTITY}]\nUser:{prompt}\nDevClaw:"],
+                    capture_output=True, text=True, timeout=timeout,
                     encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
-                    _clean = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
-                    if _clean:
-                        _dispatch_reply(channel, chat_id, _clean[:4000], request_id=request_id)
-                        _answered = True
+                    return _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
             except Exception:
                 pass
-            if not _answered:
-                # Fallback to Claude CLI for simple chat
-                try:
-                    _r = _sp.run(
-                        ["claude", "--print", "--dangerously-skip-permissions", f"简洁回答：{text}"],
-                        capture_output=True, text=True, timeout=30,
-                        cwd=str(ws_path), encoding="utf-8", errors="replace",
-                    )
-                    if _r.returncode == 0 and _r.stdout.strip():
-                        _dispatch_reply(channel, chat_id, _r.stdout.strip()[:4000], request_id=request_id)
-                        _answered = True
-                except Exception:
-                    pass
-            if _answered:
-                return  # Done! No need to queue.
-            # If both failed, fall through to queue
+            return None
 
-        # ── MEDIUM/COMPLEX: Queue for full processing ──
+        def _ask_claude(prompt, timeout=60):
+            """High-quality brain via Claude CLI (user subscription, FREE)."""
+            try:
+                _r = _sp.run(
+                    ["claude", "--print", "--dangerously-skip-permissions",
+                     f"你是DevClaw超级智能体。用中文简洁有个性地回答：{prompt}"],
+                    capture_output=True, text=True, timeout=timeout,
+                    cwd=str(ws_path), encoding="utf-8", errors="replace",
+                )
+                if _r.returncode == 0 and _r.stdout.strip():
+                    return _r.stdout.strip()
+            except Exception:
+                pass
+            return None
+
+        # ── THREE-TIER ROUTING ──
+        if _is_short and not _is_task:
+            # TIER 1: Simple chat → Ollama (2-5s), fallback Claude CLI
+            answer = _ask_ollama(text) or _ask_claude(text, 30)
+            if answer:
+                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
+                return
+
+        elif _is_task and (not assessment or not assessment.should_decompose):
+            # TIER 2: Medium tasks → Claude CLI first (high quality), fallback tool loop
+            _dispatch_reply(channel, chat_id, "收到，调用高级大脑处理中…", request_id=request_id)
+            answer = _ask_claude(text, 120)
+            if answer:
+                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
+                return
+            # Fall through to full tool loop if Claude CLI fails
+            task_q.put((channel, chat_id, text, request_id))
+            return
+
+        # TIER 3: Grand tasks → decompose + full tool loop
         if assessment and assessment.should_decompose:
-            _dispatch_reply(
-                channel, chat_id,
-                f"🧠 检测到宏大任务 (复杂度 {assessment.score}/10)，将自动拆解后执行...",
-                request_id=request_id,
-            )
-        elif _is_task:
-            _dispatch_reply(channel, chat_id, "收到，处理中…", request_id=request_id)
+            _dispatch_reply(channel, chat_id,
+                f"🧠 宏大任务 (复杂度 {assessment.score}/10)，自动拆解执行中…",
+                request_id=request_id)
         else:
-            _dispatch_reply(channel, chat_id, "思考中…", request_id=request_id)
+            _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
         task_q.put((channel, chat_id, text, request_id))
 
     def survival_heartbeat_loop() -> None:
