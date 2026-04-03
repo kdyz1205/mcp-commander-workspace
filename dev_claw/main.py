@@ -469,6 +469,28 @@ def dev_claw_run(
 
     try:
         apply_proxy_env(workspace_path)
+
+        # ── Task Complexity Detector: intercept grand tasks (before API key check) ──
+        decomposition_plan = intercept_if_grand(
+            workspace_path,
+            user_instruction,
+            emit=lambda t: (print(t), _emit(t)),
+        )
+        active_instruction = user_instruction
+        if decomposition_plan:
+            first_atom = decomposition_plan.atom_tasks[0]
+            active_instruction = (
+                f"[ATOM_TASK][自动拆解阶段 1/{len(decomposition_plan.atom_tasks)}] {first_atom.title}\n"
+                f"{first_atom.description}\n\n"
+                "注意: 只完成当前阶段的工作。完成后系统会自动从工作队列取出下一阶段。"
+            )
+            msg = (
+                f"老板，任务太大，我已经自动将其拆分为 {len(decomposition_plan.atom_tasks)} 个阶段"
+                "并排入我的工作队列。我现在开始执行阶段一。"
+            )
+            print(msg)
+            _emit(msg)
+
         parasite = survival.parasite_active()
         parasite_base_url: str | None = None
         api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -608,26 +630,6 @@ def dev_claw_run(
             base_core = base_core + "\n\n" + system_append.strip()
 
         catalog = registry.catalog_text() if skills_on else "## Skills\n(disabled via DEVCLAW_SKILLS=0)\n"
-
-        # ── Task Complexity Detector: intercept grand tasks ──
-        decomposition_plan = intercept_if_grand(
-            workspace_path,
-            user_instruction,
-            emit=_emit if progress_hook else None,
-        )
-        active_instruction = user_instruction
-        if decomposition_plan:
-            # Grand task intercepted → rewrite instruction to first atom task
-            first_atom = decomposition_plan.atom_tasks[0]
-            active_instruction = (
-                f"[ATOM_TASK][自动拆解阶段 1/{len(decomposition_plan.atom_tasks)}] {first_atom.title}\n"
-                f"{first_atom.description}\n\n"
-                "注意: 只完成当前阶段的工作。完成后系统会自动从工作队列取出下一阶段。"
-            )
-            _emit(
-                f"老板，任务太大，我已经自动将其拆分为 {len(decomposition_plan.atom_tasks)} 个阶段"
-                "并排入我的工作队列。我现在开始执行阶段一。"
-            )
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": base_core + "\n\n" + catalog},
