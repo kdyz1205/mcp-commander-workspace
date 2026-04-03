@@ -1,17 +1,25 @@
 """
-REM sleep: episodic memory consolidation.
+REM sleep: episodic memory consolidation + meta-prompt optimization.
 
 Simulates human REM sleep — compress 24 h of raw logs into distilled
 rules and prune stale data.  The consolidated rules can be injected
 into the system prompt to give the agent long-term memory.
 
-Lifecycle:  collect -> compress -> consolidate -> prune
+Phase 5 adds "Soul Optimization": the agent analyses its own
+performance metrics and writes self-improvement rules into
+.cursorrules so that the next session benefits from past mistakes.
+
+Lifecycle:  collect -> compress -> consolidate -> prune -> meta-optimize
 """
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
+import shutil
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -61,6 +69,27 @@ def _safe_ts(entry: dict[str, Any]) -> str:
         if val is not None:
             return str(val)
     return ""
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean from an environment variable."""
+    v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v in {"1", "true", "yes", "on"}
+
+
+def _ts_within_hours(ts_str: str, hours: float) -> bool:
+    """Return True if *ts_str* is within the last *hours* hours."""
+    try:
+        if ts_str.replace(".", "", 1).replace("-", "").isdigit():
+            dt = datetime.fromtimestamp(float(ts_str), tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+        cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+        return dt.timestamp() >= cutoff
+    except (ValueError, TypeError, OSError):
+        return True  # if we can't parse, assume recent
 
 
 def _hour_bucket(ts_str: str) -> str:
@@ -418,17 +447,454 @@ def run_rem_sleep(
         f"kept {prune_summary['kept_files']}."
     )
 
+    # --- Phase 5: Meta-prompt optimization (Soul Optimization) ---
+    meta_summary: dict[str, Any] | None = None
+    if _env_bool("META_PROMPT_OPTIMIZATION", default=True):
+        _emit("REM sleep: running meta-prompt optimization...")
+        try:
+            meta_summary = run_meta_optimization(ws, emit=emit)
+            _emit(
+                f"REM sleep: meta-optimization added "
+                f"{meta_summary.get('rules_added', 0)} rules to .cursorrules."
+            )
+        except Exception as exc:
+            _emit(f"REM sleep: meta-optimization failed — {exc}")
+            meta_summary = {"error": str(exc)}
+
     return {
         "episode_count": len(episodes),
         "rule_count": len(rules),
         "consolidated_path": str(consolidated_path),
         "prune_summary": prune_summary,
         "rules": rules,
+        "meta_optimization": meta_summary,
     }
 
 
 # ---------------------------------------------------------------------------
-# 6. Load consolidated rules (for system prompt injection)
+# 6. Meta-Prompt Optimization ("Soul Optimization")
+# ---------------------------------------------------------------------------
+
+_AUTO_EVOLVED_SECTION = "# === DevClaw Auto-Evolved Rules ==="
+
+
+def collect_performance_metrics(
+    workspace: Path,
+    hours: float = 168,
+) -> dict[str, Any]:
+    """
+    Collect performance metrics from the last *hours* (default 168 = 1 week).
+
+    Sources:
+        .claw/action_outcomes.jsonl      – per-task success/failure + tokens
+        .claw/error_attributions.jsonl   – detailed failure analysis
+    """
+    ws = Path(workspace).resolve()
+    claw = ws / ".claw"
+
+    outcomes = _read_jsonl(claw / "action_outcomes.jsonl", max_lines=2000)
+    errors = _read_jsonl(claw / "error_attributions.jsonl", max_lines=2000)
+
+    # Filter to time window
+    outcomes = [
+        o for o in outcomes
+        if _ts_within_hours(_safe_ts(o), hours)
+    ]
+    errors = [
+        e for e in errors
+        if _ts_within_hours(_safe_ts(e), hours)
+    ]
+
+    # --- task_success_rate ---
+    total_tasks = len(outcomes)
+    success_count = sum(
+        1 for o in outcomes
+        if str(o.get("status", "")).lower() in ("success", "ok", "done", "completed")
+    )
+    task_success_rate = (success_count / total_tasks) if total_tasks else 0.0
+
+    # --- avg_tokens_per_task ---
+    token_values = [
+        int(o["tokens"]) for o in outcomes
+        if "tokens" in o and str(o["tokens"]).isdigit()
+    ]
+    avg_tokens_per_task = (
+        (sum(token_values) / len(token_values)) if token_values else 0.0
+    )
+
+    # --- error_rate_by_type ---
+    error_rate_by_type: dict[str, int] = defaultdict(int)
+    for o in outcomes:
+        status = str(o.get("status", "")).lower()
+        if status in ("error", "failed", "failure"):
+            err_type = str(o.get("error_type", o.get("error", "unknown")))[:120]
+            error_rate_by_type[err_type] += 1
+    for e in errors:
+        err_type = str(e.get("type", e.get("error_type", "unknown")))[:120]
+        error_rate_by_type[err_type] += 1
+
+    # --- most_failed_tools ---
+    tool_fail: dict[str, int] = defaultdict(int)
+    tool_total: dict[str, int] = defaultdict(int)
+    for o in outcomes:
+        tool = o.get("tool") or o.get("tool_name")
+        if not tool:
+            continue
+        tool_total[str(tool)] += 1
+        status = str(o.get("status", "")).lower()
+        if status in ("error", "failed", "failure"):
+            tool_fail[str(tool)] += 1
+    most_failed_tools: list[dict[str, Any]] = sorted(
+        [
+            {"tool": t, "failures": tool_fail[t], "total": tool_total[t]}
+            for t in tool_fail
+        ],
+        key=lambda x: x["failures"],
+        reverse=True,
+    )[:10]
+
+    # --- delegation_effectiveness ---
+    self_outcomes = [
+        o for o in outcomes if str(o.get("executor", "self")).lower() == "self"
+    ]
+    delegated_outcomes = [
+        o for o in outcomes if str(o.get("executor", "self")).lower() != "self"
+    ]
+    self_success = sum(
+        1 for o in self_outcomes
+        if str(o.get("status", "")).lower() in ("success", "ok", "done", "completed")
+    )
+    delegated_success = sum(
+        1 for o in delegated_outcomes
+        if str(o.get("status", "")).lower() in ("success", "ok", "done", "completed")
+    )
+    delegation_effectiveness = {
+        "self_total": len(self_outcomes),
+        "self_success": self_success,
+        "self_rate": (self_success / len(self_outcomes)) if self_outcomes else 0.0,
+        "delegated_total": len(delegated_outcomes),
+        "delegated_success": delegated_success,
+        "delegated_rate": (
+            (delegated_success / len(delegated_outcomes))
+            if delegated_outcomes
+            else 0.0
+        ),
+    }
+
+    # --- error attributions summary ---
+    attribution_summary: dict[str, int] = defaultdict(int)
+    for e in errors:
+        cause = str(e.get("cause", e.get("attribution", "unknown")))[:120]
+        attribution_summary[cause] += 1
+
+    return {
+        "window_hours": hours,
+        "total_tasks": total_tasks,
+        "task_success_rate": task_success_rate,
+        "avg_tokens_per_task": avg_tokens_per_task,
+        "error_rate_by_type": dict(error_rate_by_type),
+        "most_failed_tools": most_failed_tools,
+        "delegation_effectiveness": delegation_effectiveness,
+        "attribution_summary": dict(attribution_summary),
+        "total_error_attributions": len(errors),
+    }
+
+
+def generate_optimization_rules(
+    metrics: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    """
+    Generate new .cursorrules rules from performance metrics.
+
+    Tries LLM generation first (Claude CLI or Ollama), falls back to
+    heuristic rule generation.
+    """
+    ws = Path(workspace).resolve()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    prefix = f"# [Auto-evolved {today}]"
+
+    # --- attempt LLM-based generation ---
+    llm_rules = _try_llm_rule_generation(metrics, prefix)
+    if llm_rules:
+        return llm_rules
+
+    # --- fallback: heuristic rule generation ---
+    return _heuristic_rule_generation(metrics, prefix)
+
+
+def _try_llm_rule_generation(
+    metrics: dict[str, Any],
+    prefix: str,
+) -> list[str]:
+    """Try generating rules via Claude CLI or Ollama. Returns [] on failure."""
+    metrics_summary = json.dumps(metrics, indent=2, ensure_ascii=False, default=str)
+    prompt = (
+        "You are an AI agent optimizer. Given these performance metrics from the last week, "
+        "generate 3-8 one-line actionable rules for a .cursorrules file. "
+        "Each rule must be specific, actionable, and address a real issue in the metrics. "
+        "Output ONLY the rules, one per line, no numbering, no explanation.\n\n"
+        f"Metrics:\n{metrics_summary[:3000]}"
+    )
+
+    # Try Claude CLI first
+    for cmd in (
+        ["claude", "--print", "-p", prompt],
+        ["ollama", "run", "llama3", prompt],
+    ):
+        exe = cmd[0]
+        if not shutil.which(exe):
+            continue
+        try:
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if cp.returncode == 0 and cp.stdout.strip():
+                raw_lines = cp.stdout.strip().splitlines()
+                rules: list[str] = []
+                for line in raw_lines:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # Strip any numbering like "1. " or "- "
+                    for pat in ("1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "- ", "* "):
+                        if line.startswith(pat):
+                            line = line[len(pat):].strip()
+                    if len(line) > 10:
+                        rules.append(f"{prefix} {line}")
+                if rules:
+                    return rules[:8]
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            continue
+
+    return []
+
+
+def _heuristic_rule_generation(
+    metrics: dict[str, Any],
+    prefix: str,
+) -> list[str]:
+    """Generate rules from metrics using pattern-matching heuristics."""
+    rules: list[str] = []
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # --- Tool failure rules ---
+    for tool_info in metrics.get("most_failed_tools", []):
+        tool = tool_info["tool"]
+        failures = tool_info["failures"]
+        total = tool_info["total"]
+        if total >= 3 and failures / total > 0.4:
+            rules.append(
+                f"{prefix} Before using {tool}, always verify preconditions — "
+                f"it failed {failures}/{total} times last week."
+            )
+
+    # --- Delegation rules ---
+    deleg = metrics.get("delegation_effectiveness", {})
+    self_rate = deleg.get("self_rate", 0)
+    deleg_rate = deleg.get("delegated_rate", 0)
+    deleg_total = deleg.get("delegated_total", 0)
+    if deleg_total >= 3 and deleg_rate > self_rate + 0.15:
+        rules.append(
+            f"{prefix} For complex tasks, prefer delegating to sub-agents — "
+            f"delegated success rate ({deleg_rate:.0%}) exceeds self ({self_rate:.0%})."
+        )
+    elif deleg_total >= 3 and self_rate > deleg_rate + 0.15:
+        rules.append(
+            f"{prefix} Prefer handling tasks directly — "
+            f"self success rate ({self_rate:.0%}) exceeds delegated ({deleg_rate:.0%})."
+        )
+
+    # --- Error-type clustering rules ---
+    error_types = metrics.get("error_rate_by_type", {})
+    for err_type, count in sorted(error_types.items(), key=lambda x: x[1], reverse=True)[:3]:
+        if count >= 3:
+            rules.append(
+                f"{prefix} Watch for '{err_type}' errors (occurred {count}x last week) — "
+                f"add defensive checks before operations that trigger this."
+            )
+
+    # --- Token usage rule ---
+    avg_tokens = metrics.get("avg_tokens_per_task", 0)
+    if avg_tokens > 5000:
+        rules.append(
+            f"{prefix} Average token usage is high ({avg_tokens:.0f}/task) — "
+            f"for routine tasks, try simpler approaches first before deep analysis."
+        )
+
+    # --- Low success rate rule ---
+    success_rate = metrics.get("task_success_rate", 1.0)
+    if metrics.get("total_tasks", 0) >= 5 and success_rate < 0.6:
+        rules.append(
+            f"{prefix} Overall task success rate is low ({success_rate:.0%}) — "
+            f"pause and validate approach before executing multi-step plans."
+        )
+
+    # --- Attribution-based rules ---
+    for cause, count in sorted(
+        metrics.get("attribution_summary", {}).items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:2]:
+        if count >= 2:
+            rules.append(
+                f"{prefix} Failure cause '{cause}' attributed {count}x — "
+                f"add pre-check or fallback path for this failure mode."
+            )
+
+    return rules[:8]
+
+
+def append_to_cursorrules(
+    workspace: Path,
+    rules: list[str],
+) -> int:
+    """
+    Append auto-evolved rules to .cursorrules.
+
+    - Reads current .cursorrules
+    - Skips rules that are >80% similar to any existing line (fuzzy dedup)
+    - Appends under ``# === DevClaw Auto-Evolved Rules ===`` section
+    - NEVER modifies existing rules — only appends
+    - Returns count of rules actually added
+    """
+    ws = Path(workspace).resolve()
+    cr_path = ws / ".cursorrules"
+
+    # Read existing content
+    existing_text = ""
+    if cr_path.is_file():
+        try:
+            existing_text = cr_path.read_text(encoding="utf-8")
+        except OSError:
+            existing_text = ""
+
+    existing_lines = [
+        line.strip() for line in existing_text.splitlines() if line.strip()
+    ]
+
+    # Fuzzy dedup: skip if >80% similar to any existing line
+    added: list[str] = []
+    for rule in rules:
+        rule_stripped = rule.strip()
+        if not rule_stripped:
+            continue
+        is_dup = False
+        for existing in existing_lines:
+            ratio = difflib.SequenceMatcher(
+                None, rule_stripped.lower(), existing.lower()
+            ).ratio()
+            if ratio > 0.80:
+                is_dup = True
+                break
+        if not is_dup:
+            added.append(rule_stripped)
+            existing_lines.append(rule_stripped)  # prevent intra-batch dups
+
+    if not added:
+        return 0
+
+    # Build the append block
+    section_header = _AUTO_EVOLVED_SECTION
+    if section_header not in existing_text:
+        block = f"\n\n{section_header}\n"
+    else:
+        block = "\n"
+
+    block += "\n".join(added) + "\n"
+
+    # Append (never overwrite existing content)
+    try:
+        with cr_path.open("a", encoding="utf-8") as f:
+            f.write(block)
+    except OSError:
+        return 0
+
+    return len(added)
+
+
+def run_meta_optimization(
+    workspace: Path,
+    emit: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Full meta-prompt optimization cycle:
+    1. Collect performance metrics (last 7 days)
+    2. Generate optimization rules
+    3. Append to .cursorrules
+    4. Log what was added
+    5. Return summary
+    """
+    ws = Path(workspace).resolve()
+
+    def _emit(msg: str) -> None:
+        if emit:
+            try:
+                emit(msg)
+            except Exception:
+                pass
+
+    _emit("Meta-optimization: collecting performance metrics (7d)...")
+    metrics = collect_performance_metrics(ws, hours=168)
+    _emit(
+        f"Meta-optimization: {metrics['total_tasks']} tasks, "
+        f"{metrics['task_success_rate']:.0%} success rate."
+    )
+
+    _emit("Meta-optimization: generating optimization rules...")
+    rules = generate_optimization_rules(metrics, ws)
+    _emit(f"Meta-optimization: generated {len(rules)} candidate rules.")
+
+    _emit("Meta-optimization: appending to .cursorrules...")
+    added_count = append_to_cursorrules(ws, rules)
+    _emit(f"Meta-optimization: added {added_count} new rules to .cursorrules.")
+
+    # Persist timestamp for debouncing
+    ts_path = ws / ".claw" / "meta_optimization_last.json"
+    ts_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        ts_path.write_text(
+            json.dumps({
+                "last_run": datetime.now(timezone.utc).isoformat(),
+                "last_run_epoch": time.time(),
+                "rules_generated": len(rules),
+                "rules_added": added_count,
+                "metrics_snapshot": {
+                    "total_tasks": metrics.get("total_tasks", 0),
+                    "task_success_rate": metrics.get("task_success_rate", 0),
+                    "total_error_attributions": metrics.get("total_error_attributions", 0),
+                },
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+    # Log to memory if available
+    try:
+        from claw_runtime.memory import append_memory
+        append_memory(
+            ws, "lesson",
+            f"[meta_optimization] Added {added_count} auto-evolved rules to .cursorrules "
+            f"(metrics: {metrics['total_tasks']} tasks, {metrics['task_success_rate']:.0%} success).",
+        )
+    except Exception:
+        pass
+
+    summary: dict[str, Any] = {
+        "metrics": metrics,
+        "rules_generated": len(rules),
+        "rules_added": added_count,
+        "rules": rules,
+    }
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# 7. Load consolidated rules (for system prompt injection)
 # ---------------------------------------------------------------------------
 
 def load_consolidated_rules(workspace: str | Path) -> list[dict[str, Any]]:

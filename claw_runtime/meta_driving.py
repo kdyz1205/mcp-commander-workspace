@@ -157,6 +157,156 @@ class ReasoningOptimizer:
         )
 
 
+def _learning_loop(
+    workspace: Path,
+    snapshot: dict[str, Any],
+    actions: list[dict[str, Any]],
+) -> None:
+    """Learning Loop: read failures -> research -> synthesize new skills.
+
+    Reads .claw/error_attributions.jsonl for the last 24 hours, groups failures
+    by error_type, and for each recurring type (>= 2 occurrences) checks whether
+    a solution already exists. If not, enqueues skill synthesis via the
+    code_synthesis_pipeline.
+
+    Debounced to run at most once per hour via .claw/learning_loop_last.json.
+    """
+    ws = Path(workspace).resolve()
+
+    # ── Debounce: only run once per hour ──
+    debounce_path = ws / ".claw" / "learning_loop_last.json"
+    now = time.time()
+    debounce_sec = float(os.environ.get("META_LEARNING_LOOP_SEC", "3600") or "3600")
+    try:
+        if debounce_path.is_file():
+            data = json.loads(debounce_path.read_text(encoding="utf-8"))
+            last_run = float(data.get("last_run_epoch", 0))
+            if now - last_run < debounce_sec:
+                return
+    except (json.JSONDecodeError, OSError, ValueError, TypeError):
+        pass
+
+    # ── 1. Read error_attributions.jsonl for last 24 hours ──
+    attr_path = ws / ".claw" / "error_attributions.jsonl"
+    if not attr_path.is_file():
+        return
+
+    cutoff = now - 86400  # 24 hours
+    recent: list[dict[str, Any]] = []
+    try:
+        for line in attr_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and float(obj.get("ts", 0)) >= cutoff:
+                    recent.append(obj)
+            except (json.JSONDecodeError, ValueError, TypeError):
+                continue
+    except OSError:
+        return
+
+    if not recent:
+        return
+
+    # ── 2. Group failures by error_type ──
+    from collections import Counter
+    type_counts: Counter[str] = Counter()
+    type_items: dict[str, list[dict[str, Any]]] = {}
+    for attr in recent:
+        etype = str(attr.get("error_type", "unknown"))
+        type_counts[etype] += 1
+        type_items.setdefault(etype, []).append(attr)
+
+    # ── 3. For each recurring error type (>= 2 occurrences) ──
+    recurring = {etype: items for etype, items in type_items.items() if type_counts[etype] >= 2}
+    if not recurring:
+        return
+
+    # Load consolidated rules to check for existing solutions
+    existing_solutions: set[str] = set()
+    try:
+        from claw_runtime.rem_sleep import load_consolidated_rules
+        rules = load_consolidated_rules(ws)
+        for rule in rules:
+            rule_text = str(rule.get("rule", "")).lower()
+            existing_solutions.add(rule_text)
+    except (ImportError, Exception):
+        pass
+
+    synthesis_queue: list[dict[str, Any]] = []
+    for etype, items in recurring.items():
+        # 3a. Check if a solution already exists
+        etype_lower = etype.lower()
+        already_handled = any(etype_lower in sol for sol in existing_solutions)
+        if already_handled:
+            continue
+
+        # 3b. Check if proposed_solution suggests a missing tool/skill
+        for item in items:
+            proposed = str(item.get("proposed_solution", ""))
+            if not proposed:
+                continue
+            needs_skill = any(kw in proposed.lower() for kw in (
+                "missing tool", "missing skill", "install", "new capability",
+                "not found", "no module", "unknown tool", "need",
+                "create", "implement", "add support",
+            ))
+            if needs_skill:
+                # 3c. Enqueue skill synthesis task
+                synthesis_queue.append(item)
+                break  # one per error_type
+
+    if not synthesis_queue:
+        # Update debounce even if nothing to synthesize
+        _write_debounce(debounce_path, now)
+        return
+
+    # ── 4. Call the skill synthesis pipeline (Phase 3) ──
+    try:
+        from claw_runtime.code_synthesis_pipeline import (
+            detect_skill_needs,
+            run_synthesis_pipeline,
+        )
+
+        needs = detect_skill_needs(synthesis_queue, ws)
+        for need in needs:
+            try:
+                result = run_synthesis_pipeline(need, ws)
+                actions.append({
+                    "name": "learning_loop_synthesis",
+                    "detail": (
+                        f"skill={result.skill_name} success={result.success} "
+                        f"ast={result.ast_valid} sandbox={result.sandbox_safe}"
+                    ),
+                })
+            except Exception as e:  # noqa: BLE001
+                actions.append({
+                    "name": "learning_loop_synthesis_error",
+                    "detail": f"skill={need.target_skill_name} error={e!s}"[:500],
+                })
+    except ImportError as e:
+        actions.append({
+            "name": "learning_loop_import_error",
+            "detail": str(e)[:500],
+        })
+
+    _write_debounce(debounce_path, now)
+
+
+def _write_debounce(path: Path, ts: float) -> None:
+    """Write debounce timestamp to a JSON file."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"last_run_epoch": ts}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> dict[str, Any]:
     ws = Path(workspace).resolve()
     actions: list[dict[str, Any]] = []
@@ -352,6 +502,40 @@ def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> di
                         last_path.write_text(str(now), encoding="utf-8")
                 except Exception as e:  # noqa: BLE001
                     actions.append({"name": "evolve_draft_error", "detail": str(e)[:500]})
+
+    # --- Weekly meta-prompt optimization (Soul Optimization) ---
+    if _env_bool("META_PROMPT_OPTIMIZATION", default=True):
+        meta_ts_path = ws / ".claw" / "meta_optimization_last.json"
+        now_meta = time.time()
+        meta_gap = 7 * 86400  # 7 days in seconds
+        last_meta = 0.0
+        if meta_ts_path.is_file():
+            try:
+                meta_data = json.loads(meta_ts_path.read_text(encoding="utf-8"))
+                last_meta = float(meta_data.get("last_run_epoch", 0))
+            except (json.JSONDecodeError, OSError, ValueError, TypeError):
+                last_meta = 0.0
+        if now_meta - last_meta >= meta_gap:
+            try:
+                from claw_runtime.rem_sleep import run_meta_optimization
+
+                meta_result = run_meta_optimization(ws)
+                actions.append({
+                    "name": "meta_optimization",
+                    "detail": (
+                        f"rules_added={meta_result.get('rules_added', 0)}, "
+                        f"rules_generated={meta_result.get('rules_generated', 0)}"
+                    ),
+                })
+            except Exception as e:  # noqa: BLE001
+                actions.append({"name": "meta_optimization_error", "detail": str(e)[:500]})
+
+    # ── Learning Loop: read failures -> research -> synthesize new skills ──
+    if _env_bool("META_LEARNING_LOOP", default=True):
+        try:
+            _learning_loop(ws, snap, actions)
+        except Exception as e:  # noqa: BLE001
+            actions.append({"name": "learning_loop_error", "detail": str(e)[:500]})
 
     out: dict[str, Any] = {
         "ts": time.time(),

@@ -54,6 +54,7 @@ from claw_runtime.ultimate.proxy_env import (
     snapshot_proxy_env,
 )
 from claw_runtime.ultimate.self_heal import emit_rebuild_venv_scripts
+from claw_runtime.error_attribution import tool_execution_middleware
 
 
 def _workspace_root() -> str:
@@ -1017,71 +1018,86 @@ def dev_claw_run(
                     + json.dumps(args, ensure_ascii=False, indent=2)[:3500]
                 )
 
-                if name == "execute_terminal":
-                    tool_result = execute_terminal(args.get("command", ""))
-                elif name == "edit_local_file":
-                    tool_result = edit_local_file(
-                        args.get("filepath", ""),
-                        args.get("content", ""),
-                        args.get("mode", "w"),
-                    )
-                elif name == "use_browser":
-                    tool_result = use_browser_stub(args.get("task_prompt", ""))
-                elif name == "web_fetch":
-                    tool_result = web_fetch(args.get("url", ""))
-                elif name == "load_skill":
-                    tool_result = load_skill_body(registry, args.get("skill_name", ""))
-                elif name == "append_typed_memory":
-                    tool_result = append_memory(
-                        workspace_path,
-                        args.get("category", "fact"),
-                        args.get("text", ""),
-                    )
-                elif name == "safety_scan_file":
-                    tool_result = safety_scan_relative_file(args.get("filepath", ""))
-                elif name == "delegate_to_brain":
-                    from claw_runtime.cognitive_outsourcing import outsource_task
-                    _outsource_result = outsource_task(
-                        args.get("instruction", ""),
-                        args.get("task_type", "code_generate"),
-                        workspace_path,
-                        output_file=args.get("output_file"),
-                        test_cmd=args.get("test_cmd"),
-                        progress_hook=progress_hook,
-                    )
-                    tool_result = json.dumps(_outsource_result, ensure_ascii=False, indent=2)[:MAX_TOOL_CHARS]
-                elif name == "decompose_task":
-                    _was_decomposed, _decompose_report, _task_ids = decompose_and_enqueue(
-                        args.get("instruction", user_instruction),
-                        workspace_path,
-                        progress_hook=progress_hook,
-                        context=args.get("context", ""),
-                    )
-                    tool_result = _decompose_report
-                elif name == "check_task_queue":
-                    _smart_reg = SmartTaskRegistry(workspace_path)
-                    tool_result = _smart_reg.format_queue_status()
-                elif name == "install_claw_skill":
-                    if os.environ.get("DEVCLAW_ALLOW_SKILL_INSTALL", "").strip().lower() not in {
-                        "1",
-                        "true",
-                        "yes",
-                    }:
-                        tool_result = (
-                            "拒绝：安装技能需设置环境变量 DEVCLAW_ALLOW_SKILL_INSTALL=1 "
-                            "（也可用 CLI：py -m claw_runtime.cli skills-install …）。"
+                # Build executor closure for this tool call
+                def _exec(
+                    _name: str = name,
+                    _args: dict = args,
+                ) -> str:
+                    if _name == "execute_terminal":
+                        return execute_terminal(_args.get("command", ""))
+                    elif _name == "edit_local_file":
+                        return edit_local_file(
+                            _args.get("filepath", ""),
+                            _args.get("content", ""),
+                            _args.get("mode", "w"),
                         )
-                    else:
-                        from claw_runtime.skill_installer import install_skill
-
-                        tool_result = install_skill(
+                    elif _name == "use_browser":
+                        return use_browser_stub(_args.get("task_prompt", ""))
+                    elif _name == "web_fetch":
+                        return web_fetch(_args.get("url", ""))
+                    elif _name == "load_skill":
+                        return load_skill_body(registry, _args.get("skill_name", ""))
+                    elif _name == "append_typed_memory":
+                        return append_memory(
                             workspace_path,
-                            args.get("source", ""),
-                            target_name=(args.get("skill_name") or "").strip() or None,
-                            skip_safety=bool(args.get("skip_safety")),
+                            _args.get("category", "fact"),
+                            _args.get("text", ""),
                         )
-                else:
-                    tool_result = f"未知工具: {name}"
+                    elif _name == "safety_scan_file":
+                        return safety_scan_relative_file(_args.get("filepath", ""))
+                    elif _name == "delegate_to_brain":
+                        from claw_runtime.cognitive_outsourcing import outsource_task
+                        _outsource_result = outsource_task(
+                            _args.get("instruction", ""),
+                            _args.get("task_type", "code_generate"),
+                            workspace_path,
+                            output_file=_args.get("output_file"),
+                            test_cmd=_args.get("test_cmd"),
+                            progress_hook=progress_hook,
+                        )
+                        return json.dumps(_outsource_result, ensure_ascii=False, indent=2)[:MAX_TOOL_CHARS]
+                    elif _name == "decompose_task":
+                        _was_decomposed, _decompose_report, _task_ids = decompose_and_enqueue(
+                            _args.get("instruction", user_instruction),
+                            workspace_path,
+                            progress_hook=progress_hook,
+                            context=_args.get("context", ""),
+                        )
+                        return _decompose_report
+                    elif _name == "check_task_queue":
+                        _smart_reg = SmartTaskRegistry(workspace_path)
+                        return _smart_reg.format_queue_status()
+                    elif _name == "install_claw_skill":
+                        if os.environ.get("DEVCLAW_ALLOW_SKILL_INSTALL", "").strip().lower() not in {
+                            "1",
+                            "true",
+                            "yes",
+                        }:
+                            return (
+                                "拒绝：安装技能需设置环境变量 DEVCLAW_ALLOW_SKILL_INSTALL=1 "
+                                "（也可用 CLI：py -m claw_runtime.cli skills-install …）。"
+                            )
+                        else:
+                            from claw_runtime.skill_installer import install_skill
+
+                            return install_skill(
+                                workspace_path,
+                                _args.get("source", ""),
+                                target_name=(_args.get("skill_name") or "").strip() or None,
+                                skip_safety=bool(_args.get("skip_safety")),
+                            )
+                    else:
+                        return f"未知工具: {_name}"
+
+                # Run through error attribution middleware
+                try:
+                    tool_result = tool_execution_middleware(
+                        name, args, _exec, workspace_path, user_instruction,
+                    )
+                except Exception:
+                    # Middleware re-raises original exceptions; fall back to raw call
+                    # so the outer loop can handle it as before
+                    raise
 
                 preview = str(tool_result)
                 _emit("[结果] " + name + "\n" + preview[:4000] + ("…" if len(preview) > 4000 else ""))
