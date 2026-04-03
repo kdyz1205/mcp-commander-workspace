@@ -653,6 +653,12 @@ def main() -> int:
                         debounce_sec=debounce,
                         notify=_broadcast_admins,
                     )
+                # ── Consciousness tick: DevClaw thinks about itself ──
+                try:
+                    from claw_runtime.consciousness_seed import consciousness_tick
+                    consciousness_tick(ws_path)  # Silent, self-contained, debounced internally
+                except Exception:
+                    pass
             except Exception:
                 pass
             time.sleep(max(15, tick))
