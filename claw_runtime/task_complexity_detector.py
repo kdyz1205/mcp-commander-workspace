@@ -108,6 +108,17 @@ def analyze_complexity(workspace: Path, task_text: str) -> ComplexityVerdict:
     score = 0
     hits: list[str] = []
 
+    # Skip atom tasks (already decomposed) to prevent recursive re-interception
+    if task_text.startswith("[ATOM_TASK]"):
+        return ComplexityVerdict(
+            score=0,
+            level="trivial",
+            file_count=0,
+            keyword_hits=[],
+            should_intercept=False,
+            rationale="已拆解的原子任务，跳过复杂度检测。",
+        )
+
     # Check for simple task signals first
     for simple_kw in _SIMPLE_TASK_KEYWORDS:
         if simple_kw in text_lower:
@@ -281,7 +292,7 @@ def decompose_grand_task(
         enqueue_persisted_task(
             workspace,
             kind="atom_task",
-            text=f"[阶段 {at.phase}/{len(atom_tasks)}] {at.title}: {at.description}\n\n原始宏大任务: {task_text[:500]}",
+            text=f"[ATOM_TASK][阶段 {at.phase}/{len(atom_tasks)}] {at.title}: {at.description}",
             meta={
                 "phase": at.phase,
                 "total_phases": len(atom_tasks),
@@ -292,6 +303,11 @@ def decompose_grand_task(
             },
         )
         queued += 1
+
+    # Pop phase 1 from queue since it will be executed immediately by the caller.
+    # This prevents phase 1 from being executed twice (once inline, once from queue).
+    from claw_runtime.bot_task_queue import pop_persisted_tasks as _pop
+    _pop(workspace, max_n=1)
 
     return DecompositionPlan(
         original_task=task_text,

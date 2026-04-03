@@ -620,9 +620,8 @@ def dev_claw_run(
             # Grand task intercepted → rewrite instruction to first atom task
             first_atom = decomposition_plan.atom_tasks[0]
             active_instruction = (
-                f"[自动拆解阶段 1/{len(decomposition_plan.atom_tasks)}] {first_atom.title}\n"
+                f"[ATOM_TASK][自动拆解阶段 1/{len(decomposition_plan.atom_tasks)}] {first_atom.title}\n"
                 f"{first_atom.description}\n\n"
-                f"原始任务背景: {user_instruction[:500]}\n\n"
                 "注意: 只完成当前阶段的工作。完成后系统会自动从工作队列取出下一阶段。"
             )
             _emit(
