@@ -26,6 +26,11 @@ except ImportError:
     OpenAI = None  # type: ignore[assignment]
 
 from claw_runtime.bot_task_queue import SmartTaskRegistry
+from claw_runtime.cognitive_outsourcing import (
+    build_outsourcing_system_prompt,
+    probe_environment,
+    save_brain_registry,
+)
 from claw_runtime.memory import append_memory
 from claw_runtime.offline_brain import run_offline_brain
 from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
@@ -406,6 +411,27 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "delegate_to_brain",
+            "description": "将复杂任务委派给外部AI工具(如claude cli)执行。你是包工头，它们是打工仔。适用于：复杂重构、大文件改写、算法实现等你当前能力不足以完成的任务。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {"type": "string", "description": "给外部AI的详细任务指令（越详细越好）"},
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["code_refactor", "code_generate", "code_review", "complex_reasoning"],
+                        "description": "任务类型，用于选择最合适的外部AI",
+                    },
+                    "output_file": {"type": "string", "description": "期望外部AI输出到的文件路径（相对工作区）"},
+                    "test_cmd": {"type": "string", "description": "验收测试命令（可选）"},
+                },
+                "required": ["instruction", "task_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "decompose_task",
             "description": "将一个复杂宏大的任务拆解为多个原子子任务并排入执行队列。当你发现任务太大无法一次完成时使用。",
             "parameters": {
@@ -745,6 +771,19 @@ def dev_claw_run(
             "5. 如果某个子任务失败，分析原因后决定：重试 / 跳过 / 进一步拆解。\n"
             "记住：你是项目经理，不是码农。先规划，再执行。"
         )
+        # --- Cognitive Outsourcing: probe for external brains and inject consciousness ---
+        try:
+            _ext_brains = probe_environment(workspace_path)
+            if _ext_brains:
+                save_brain_registry(workspace_path, _ext_brains)
+                _outsourcing_prompt = build_outsourcing_system_prompt(_ext_brains)
+                if _outsourcing_prompt:
+                    base_core += _outsourcing_prompt
+                    brain_names = [b.name for b in _ext_brains]
+                    _emit(f"[🧠 认知外包] 发现外部智能体: {', '.join(brain_names)}")
+        except Exception:
+            pass  # Outsourcing probe must never crash the main loop
+
         if survival.jailbreak_escalated():
             base_core += (
                 "\n\n【紧急授权 — 合规边界】检测到系统连续受阻。"
@@ -987,6 +1026,17 @@ def dev_claw_run(
                     )
                 elif name == "safety_scan_file":
                     tool_result = safety_scan_relative_file(args.get("filepath", ""))
+                elif name == "delegate_to_brain":
+                    from claw_runtime.cognitive_outsourcing import outsource_task
+                    _outsource_result = outsource_task(
+                        args.get("instruction", ""),
+                        args.get("task_type", "code_generate"),
+                        workspace_path,
+                        output_file=args.get("output_file"),
+                        test_cmd=args.get("test_cmd"),
+                        progress_hook=progress_hook,
+                    )
+                    tool_result = json.dumps(_outsource_result, ensure_ascii=False, indent=2)[:MAX_TOOL_CHARS]
                 elif name == "decompose_task":
                     _was_decomposed, _decompose_report, _task_ids = decompose_and_enqueue(
                         args.get("instruction", user_instruction),
