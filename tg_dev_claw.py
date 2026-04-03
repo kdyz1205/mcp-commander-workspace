@@ -325,10 +325,6 @@ def main() -> int:
 
     _register_bot_commands(bot)
 
-    class _FastPathDone(Exception):
-        """Signal that fast-path handled the message, skip tool loop."""
-        pass
-
     def worker() -> None:
         while True:
             channel, chat_id, instruction, request_id = task_q.get()
@@ -348,89 +344,44 @@ def main() -> int:
                     time.sleep(2)
                 merged = _merged_system_append(instruction) or system_append
                 try:
-                    # ── Fast-path: simple chat → answer directly via Ollama/Claude CLI ──
-                    # Don't waste 5 minutes on the full tool loop for "你在干嘛"
-                    _is_simple_chat = len(instruction) < 200 and not any(
-                        kw in instruction.lower()
-                        for kw in (
-                            "重构", "refactor", "修复", "fix", "写代码", "write code",
-                            "部署", "deploy", "创建", "create", "开发", "develop",
-                            "执行", "execute", "运行", "run", "测试", "test",
-                            "分析", "analyze", "扫描", "scan", "交易", "trade",
+                    # ── Worker brain: Claude CLI first (fast, powerful, free) ──
+                    # Then fall back to dev_claw_run tool loop if Claude CLI unavailable
+                    import subprocess as _wsp
+                    import re as _wre
+
+                    _claude_done = False
+                    try:
+                        import shutil as _wsh
+                        _claude_bin = _wsh.which("claude") or "claude"
+                        _wr = _wsp.run(
+                            f'"{_claude_bin}" --print --dangerously-skip-permissions "{instruction[:3000]}"',
+                            capture_output=True, text=True, timeout=180, shell=True,
+                            cwd=str(ws_path), encoding="utf-8", errors="replace",
                         )
-                    )
+                        if _wr.returncode == 0 and _wr.stdout.strip():
+                            _wclean = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _wr.stdout).strip()
+                            _dispatch_reply(channel, chat_id, _wclean[:4000], request_id=request_id, kind="progress")
+                            _claude_done = True
+                    except (_wsp.TimeoutExpired, FileNotFoundError, Exception):
+                        pass
 
-                    if _is_simple_chat:
-                        _answered = False
-                        # Try Ollama subprocess directly (fastest, most reliable)
-                        try:
-                            import subprocess as _sp
-                            import shutil as _sh
-                            _ollama_bin = _sh.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
-                            for _model in ("gemma3:4b", "qwen2.5-coder:3b"):
-                                try:
-                                    _r = _sp.run(
-                                        [_ollama_bin, "run", _model, instruction],
-                                        capture_output=True, text=True, timeout=30,
-                                        encoding="utf-8", errors="replace",
-                                    )
-                                    if _r.returncode == 0 and _r.stdout.strip():
-                                        # Strip ANSI escape sequences from Ollama terminal output
-                                        import re as _re
-                                        _clean = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
-                                        _dispatch_reply(channel, chat_id, _clean[:4000], request_id=request_id, kind="progress")
-                                        _answered = True
-                                        break
-                                except (_sp.TimeoutExpired, FileNotFoundError):
-                                    continue
-                        except Exception:
-                            pass
-                        # Try Claude CLI if Ollama failed
-                        if not _answered:
-                            try:
-                                import subprocess as _sp
-                                _r = _sp.run(
-                                    ["claude", "--print", "--dangerously-skip-permissions", instruction],
-                                    capture_output=True, text=True, timeout=60,
-                                    cwd=str(ws_path), encoding="utf-8", errors="replace",
-                                )
-                                if _r.returncode == 0 and _r.stdout.strip():
-                                    _dispatch_reply(channel, chat_id, _r.stdout.strip()[:4000], request_id=request_id, kind="progress")
-                                    _answered = True
-                            except Exception:
-                                pass
-                        if _answered:
-                            raise _FastPathDone()  # Jump to finally, skip tool loop
-                        # If all failed, fall through to full dev_claw_run
+                    if not _claude_done:
+                        # Fallback: full dev_claw_run tool loop
+                        def hook(msg: str) -> None:
+                            s = msg.strip()
+                            _noise = ("[离线","[自愈","[工具]","[结果]","[配额","[生存","DevClaw 启动",
+                                      "工作区:","通道:","模型:","[寄生脑]","[完成]\n离线","[Fallback]",
+                                      "[🧠 认知外包]","离线降级脑","self_heal:","skill_synthesis:")
+                            if any(s.startswith(p) for p in _noise):
+                                return
+                            _dispatch_reply(channel, chat_id, msg, request_id=request_id, kind="progress")
 
-                    # ── Full tool loop for complex tasks ──
-                    # Strict noise filter: only final answers reach the user
-                    _INTERNAL_NOISE = (
-                        "[离线动作]", "[离线降级脑]", "[自愈准备]",
-                        "[工具]", "[结果]", "[配额", "[生存 ",
-                        "DevClaw 启动", "工作区:", "通道:", "模型:",
-                        "[寄生脑]", "[完成]\n离线", "[停止]",
-                        "[🧠 认知外包]", "[Fallback]",
-                        "离线降级脑已完成", "动作:\n-",
-                    )
-
-                    def hook(msg: str) -> None:
-                        stripped = msg.strip()
-                        if any(stripped.startswith(p) for p in _INTERNAL_NOISE):
-                            return
-                        # Also filter multi-line maintenance summaries
-                        if "self_heal:" in stripped or "skill_synthesis:" in stripped or "treasury_proposal:" in stripped:
-                            return
-                        if "reasoning_episode:" in stripped:
-                            return
-                        _dispatch_reply(channel, chat_id, msg, request_id=request_id, kind="progress")
-
-                    dev_claw_run(
-                        instruction,
-                        max_iterations=max_iters,
-                        system_append=merged,
-                        progress_hook=hook,
-                    )
+                        dev_claw_run(
+                            instruction,
+                            max_iterations=max_iters,
+                            system_append=merged,
+                            progress_hook=hook,
+                        )
                     if channel == "local":
                         _dispatch_reply(
                             channel,
@@ -439,8 +390,6 @@ def main() -> int:
                             request_id=request_id,
                             kind="complete",
                         )
-                except _FastPathDone:
-                    pass  # Fast-path handled it, skip to finally
                 except Exception as e:  # noqa: BLE001
                     try:
                         append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
@@ -566,12 +515,13 @@ def main() -> int:
             return None
 
         def _ask_claude(prompt, timeout=60):
-            """High-quality brain via Claude CLI (user subscription, FREE)."""
+            """High-quality brain via Claude CLI (user subscription, FREE).
+            Claude CLI has FULL tool access — it can read/write files, run commands, etc."""
             try:
+                _claude_path = _sh.which("claude") or "claude"
                 _r = _sp.run(
-                    ["claude", "--print", "--dangerously-skip-permissions",
-                     f"你是DevClaw超级智能体。用中文简洁有个性地回答：{prompt}"],
-                    capture_output=True, text=True, timeout=timeout,
+                    f'"{_claude_path}" --print --dangerously-skip-permissions "{prompt[:3000]}"',
+                    capture_output=True, text=True, timeout=timeout, shell=True,
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
@@ -597,17 +547,8 @@ def main() -> int:
                 "改进", "improve", "优化", "optimize", "进化", "evolve",
                 "自己", "self", "学习", "learn",
             ))
-            if _needs_tools:
-                # Must go through tool loop for actual operations
-                _dispatch_reply(channel, chat_id, "收到，执行中…", request_id=request_id)
-                task_q.put((channel, chat_id, text, request_id))
-                return
-            # Pure reasoning/analysis → Claude CLI is enough
-            _dispatch_reply(channel, chat_id, "收到，调用高级大脑…", request_id=request_id)
-            answer = _ask_claude(text, 120)
-            if answer:
-                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
-                return
+            # Queue ALL medium tasks for worker — worker uses Claude CLI brain
+            _dispatch_reply(channel, chat_id, "收到，执行中…", request_id=request_id)
             task_q.put((channel, chat_id, text, request_id))
             return
 

@@ -505,6 +505,70 @@ def _assistant_to_dict(msg: Any) -> dict[str, Any]:
     return d
 
 
+def _run_via_claude_cli(
+    workspace_path: Path,
+    user_instruction: str,
+    emit: Callable[[str], None] | None = None,
+) -> bool | None:
+    """
+    Brain Switch: Use Claude CLI as the execution brain.
+
+    Claude CLI uses the user's subscription (free for DevClaw).
+    It has full tool access (read/write files, run terminal commands).
+    This is the "outsource the whole job" path.
+
+    Returns True (success), False (failure), or None (Claude CLI unavailable).
+    """
+    import subprocess
+    import shutil
+    import re
+
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        return None
+
+    if emit:
+        emit("[🧠 Claude CLI] 正在用高级大脑处理任务…")
+
+    try:
+        result = subprocess.run(
+            [
+                claude_bin,
+                "--print",
+                "--dangerously-skip-permissions",
+                f"你是DevClaw超级智能体。在工作区 {workspace_path} 中执行以下任务：\n\n{user_instruction}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,  # 3 minutes max
+            cwd=str(workspace_path),
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        output = result.stdout.strip() if result.stdout else ""
+        if result.returncode == 0 and output:
+            if emit:
+                # Clean output for user
+                clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', output).strip()
+                emit(clean[:4000])
+            return True
+        else:
+            stderr = result.stderr.strip()[:500] if result.stderr else ""
+            if emit and stderr:
+                emit(f"[Claude CLI 报错] {stderr[:200]}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        if emit:
+            emit("[Claude CLI] 执行超时 (180s)，任务可能太复杂")
+        return False
+    except Exception as e:
+        if emit:
+            emit(f"[Claude CLI] 不可用: {e!s}")
+        return None
+
+
 def _run_self_driving_queue(
     workspace_path: Path,
     *,
@@ -868,6 +932,11 @@ def dev_claw_run(
                         msg = f"[生存状态 CRITICAL] {reason}\n已停止云端 API，并转入本地自治降级路径。"
                         print(msg, file=sys.stderr)
                         _emit(msg)
+                        # Try Claude CLI before offline brain
+                        _claude_ok = _run_via_claude_cli(workspace_path, user_instruction, _emit)
+                        if _claude_ok is not None:
+                            exit_success = bool(_claude_ok)
+                            return exit_success
                         if _offline_brain_enabled():
                             result = run_offline_brain(
                                 workspace_path,
@@ -892,17 +961,26 @@ def dev_claw_run(
                 if parasite:
                     probe_timeout = max(8.0, request_timeout / 2.0)  # Generous timeout for high-memory systems
                     ok, detail = _probe_compatible_backend(parasite_base_url or "", timeout=probe_timeout)
-                    if not ok and _offline_brain_enabled():
-                        _emit(f"[寄生脑] 本地兼容端点预探测失败（{detail}），直接转离线研究脑。")
-                        result = run_offline_brain(
-                            workspace_path,
-                            user_instruction,
-                            emit=_emit if progress_hook else None,
-                            failure_reason=f"parasite backend probe failure: {detail}",
+                    if not ok:
+                        # ── Brain Switch: Parasite failed → try Claude CLI (0.2s switch) ──
+                        _emit("[脑切换] 本地模型不可达，切换到 Claude CLI 大脑…")
+                        _claude_result = _run_via_claude_cli(
+                            workspace_path, user_instruction, _emit,
                         )
-                        _emit("[完成]\n" + result.summary)
-                        exit_success = True
-                        return True
+                        if _claude_result is not None:
+                            exit_success = _claude_result
+                            return _claude_result
+                        # Claude CLI also failed → offline brain as last resort
+                        if _offline_brain_enabled():
+                            result = run_offline_brain(
+                                workspace_path,
+                                user_instruction,
+                                emit=_emit if progress_hook else None,
+                                failure_reason=f"all brains failed: {detail}",
+                            )
+                            _emit("[完成]\n" + result.summary)
+                            exit_success = True
+                            return True
                     _emit(f"[寄生脑] 正在连接本地兼容端点；若 {request_timeout:.0f}s 内无响应，将自动转离线研究脑。")
                 response = client.chat.completions.create(
                     model=model,
