@@ -510,20 +510,74 @@ def main() -> int:
                 request_id=request_id,
             )
             return
-        # Prefrontal cortex: check if task needs auto-decomposition before queuing
+        # ── Intelligent routing: pick the right brain for the task ──
+        # Simple chat → Ollama (fast, local, <5s)
+        # Medium tasks → Claude CLI (user's subscription, not API, high quality)
+        # Grand tasks → decompose + Claude CLI
         try:
             from claw_runtime.task_complexity_detector import assess_complexity
             assessment = assess_complexity(text, workspace=ws_path)
-            if assessment.should_decompose:
-                _dispatch_reply(
-                    channel, chat_id,
-                    f"🧠 检测到宏大任务 (复杂度 {assessment.score}/10)，将自动拆解后执行...",
-                    request_id=request_id,
-                )
-            else:
-                _dispatch_reply(channel, chat_id, "已入队，DevClaw 开始处理…", request_id=request_id)
         except Exception:
-            _dispatch_reply(channel, chat_id, "已入队，DevClaw 开始处理…", request_id=request_id)
+            assessment = None
+
+        _task_keywords = (
+            "重构", "refactor", "修复", "fix", "写代码", "write code",
+            "部署", "deploy", "创建", "create", "开发", "develop",
+            "执行", "execute", "运行", "run", "测试", "test",
+            "分析", "analyze", "扫描", "scan", "交易", "trade",
+            "搜索", "search", "抓取", "fetch", "安装", "install",
+        )
+        _is_task = any(kw in text.lower() for kw in _task_keywords)
+        _is_short = len(text) < 150
+
+        if _is_short and not _is_task:
+            # ── FAST PATH: Simple chat, answer immediately, don't queue ──
+            import subprocess as _sp
+            import shutil as _sh
+            import re as _re
+            _answered = False
+            _ollama_bin = _sh.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
+            try:
+                _r = _sp.run(
+                    [_ollama_bin, "run", "gemma3:4b", text],
+                    capture_output=True, text=True, timeout=30,
+                    encoding="utf-8", errors="replace",
+                )
+                if _r.returncode == 0 and _r.stdout.strip():
+                    _clean = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
+                    if _clean:
+                        _dispatch_reply(channel, chat_id, _clean[:4000], request_id=request_id)
+                        _answered = True
+            except Exception:
+                pass
+            if not _answered:
+                # Fallback to Claude CLI for simple chat
+                try:
+                    _r = _sp.run(
+                        ["claude", "--print", "--dangerously-skip-permissions", f"简洁回答：{text}"],
+                        capture_output=True, text=True, timeout=30,
+                        cwd=str(ws_path), encoding="utf-8", errors="replace",
+                    )
+                    if _r.returncode == 0 and _r.stdout.strip():
+                        _dispatch_reply(channel, chat_id, _r.stdout.strip()[:4000], request_id=request_id)
+                        _answered = True
+                except Exception:
+                    pass
+            if _answered:
+                return  # Done! No need to queue.
+            # If both failed, fall through to queue
+
+        # ── MEDIUM/COMPLEX: Queue for full processing ──
+        if assessment and assessment.should_decompose:
+            _dispatch_reply(
+                channel, chat_id,
+                f"🧠 检测到宏大任务 (复杂度 {assessment.score}/10)，将自动拆解后执行...",
+                request_id=request_id,
+            )
+        elif _is_task:
+            _dispatch_reply(channel, chat_id, "收到，处理中…", request_id=request_id)
+        else:
+            _dispatch_reply(channel, chat_id, "思考中…", request_id=request_id)
         task_q.put((channel, chat_id, text, request_id))
 
     def survival_heartbeat_loop() -> None:
