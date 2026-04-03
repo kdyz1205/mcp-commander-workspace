@@ -57,25 +57,46 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Add Ollama to PATH if installed
+_ollama_dir = os.path.expanduser("~/AppData/Local/Programs/Ollama")
+if os.path.isdir(_ollama_dir) and _ollama_dir not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _ollama_dir + os.pathsep + os.environ.get("PATH", "")
+
 # Auto-start Ollama service if not running (critical for parasite mode)
 def _ensure_ollama_running() -> None:
     import subprocess as _sp
+    import urllib.request
+    import urllib.error
+    # Check if Ollama API is reachable
     try:
-        _sp.run("curl -s http://127.0.0.1:11434/api/tags", shell=True,
-                capture_output=True, timeout=3)
+        req = urllib.request.Request("http://127.0.0.1:11434/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            if resp.status == 200:
+                print("[startup] Ollama already running", file=sys.stderr)
+                return
     except Exception:
-        # Ollama not running, try to start it
-        for candidate in (
-            os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe"),
-            "ollama",
-        ):
+        pass
+    # Not running — start it
+    for candidate in (
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Programs", "Ollama", "ollama.exe"),
+        "ollama",
+    ):
+        try:
+            _sp.Popen([candidate, "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                      creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+            print(f"[startup] Auto-started Ollama: {candidate}", file=sys.stderr)
+            import time as _time; _time.sleep(5)  # Give it time to bind port
+            # Verify
             try:
-                _sp.Popen([candidate, "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-                print(f"[startup] Auto-started Ollama: {candidate}", file=sys.stderr)
-                import time as _time; _time.sleep(3)
-                break
-            except (OSError, FileNotFoundError):
-                continue
+                req = urllib.request.Request("http://127.0.0.1:11434/api/tags", method="GET")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if resp.status == 200:
+                        print("[startup] Ollama verified running", file=sys.stderr)
+            except Exception:
+                print("[startup] Ollama started but not yet responding", file=sys.stderr)
+            break
+        except (OSError, FileNotFoundError):
+            continue
 
 _ensure_ollama_running()
 
@@ -324,7 +345,19 @@ def main() -> int:
                 merged = _merged_system_append(instruction) or system_append
                 try:
 
+                    # Internal noise filter: don't spam user with maintenance logs
+                    _INTERNAL_PREFIXES = (
+                        "[离线动作]", "[离线降级脑]", "[自愈准备]",
+                        "[工具]", "[结果]", "[配额", "[生存 ",
+                        "DevClaw 启动", "工作区:", "通道:", "模型:",
+                        "[寄生脑]",
+                    )
+
                     def hook(msg: str) -> None:
+                        # Filter: only send user-facing messages to TG
+                        stripped = msg.strip()
+                        if any(stripped.startswith(p) for p in _INTERNAL_PREFIXES):
+                            return  # Swallow internal noise
                         _dispatch_reply(channel, chat_id, msg, request_id=request_id, kind="progress")
 
                     dev_claw_run(

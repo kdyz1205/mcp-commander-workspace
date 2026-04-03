@@ -118,12 +118,55 @@ def run_offline_brain(
     text = (user_instruction or "").strip()
     actions: list[dict[str, str]] = []
 
-    _emit(
-        emit,
-        "[离线降级脑] 云端模型不可用，已切到本地确定性编排模式。"
-        f"\n状态: {state.value}\n原因: {failure_reason or reason}",
-    )
+    # ── PRIORITY 1: Answer the user's actual question FIRST ──────────
+    # The user asked something. They don't care about our maintenance.
+    # Try every possible brain to give them a real answer.
+    _user_answered = False
+    if text and not text.startswith("[") and not text.startswith("/"):
+        # Try 1: Claude CLI (free, Tier 1)
+        try:
+            from claw_runtime.cognitive_outsourcing import delegate_to_claude_cli
+            result = delegate_to_claude_cli(
+                f"用户问了这个问题，请用中文简洁友好地回答：\n\n{text}",
+                workspace,
+                timeout_sec=120,
+            )
+            if result.success and result.output.strip():
+                _emit(emit, result.output.strip()[:3000])
+                actions.append({"name": "cognitive_outsource", "detail": f"claude answered ({len(result.output)} chars)"})
+                _user_answered = True
+        except Exception:
+            pass
 
+        # Try 2: Ollama directly via subprocess (in case OpenAI client probe fails but ollama works)
+        if not _user_answered:
+            try:
+                import subprocess
+                for model_cmd in ("gemma3:4b", "qwen2.5-coder:3b", "gemma4:latest"):
+                    try:
+                        r = subprocess.run(
+                            ["ollama", "run", model_cmd, text[:2000]],
+                            capture_output=True, text=True, timeout=60,
+                            encoding="utf-8", errors="replace",
+                        )
+                        if r.returncode == 0 and r.stdout.strip():
+                            _emit(emit, r.stdout.strip()[:3000])
+                            actions.append({"name": "ollama_direct", "detail": f"{model_cmd} answered"})
+                            _user_answered = True
+                            break
+                    except (subprocess.TimeoutExpired, FileNotFoundError):
+                        continue
+            except Exception:
+                pass
+
+        if not _user_answered:
+            _emit(
+                emit,
+                "抱歉，当前所有AI大脑都不可用（云端API无额度、本地Ollama未响应、Claude CLI不可用）。"
+                "请启动Ollama (ollama serve) 或充值API后再试。",
+            )
+
+    # ── PRIORITY 2: Silent maintenance (user never sees this) ────────
     ps1, sh = emit_rebuild_venv_scripts(workspace)
     actions.append(
         {
@@ -193,46 +236,6 @@ def run_offline_brain(
         nomad = write_nomad_snapshot(workspace, extra={"source": "offline_brain", "instruction": text[:500]})
         actions.append({"name": "nomad_snapshot", "detail": str(nomad)})
         _emit(emit, f"[离线动作] 已写入 nomad snapshot: {nomad.name}")
-
-    # --- Cognitive Outsourcing: try to answer the user's actual question ---
-    # The offline brain's maintenance actions above are necessary for survival,
-    # but the user ALSO asked a question. Try to answer it via external brains.
-    _user_answered = False
-    if text and not text.startswith("["):
-        try:
-            from claw_runtime.cognitive_outsourcing import (
-                delegate_to_claude_cli,
-                probe_environment,
-                select_brain,
-                CAP_SIMPLE_CHAT,
-                CAP_COMPLEX_REASONING,
-            )
-            brains = probe_environment(workspace)
-            brain = select_brain(CAP_SIMPLE_CHAT, brains) or select_brain(CAP_COMPLEX_REASONING, brains)
-            if brain and brain.name == "claude":
-                _emit(emit, f"[认知外包] 离线脑智商不足，委派 {brain.name} 回答用户问题...")
-                result = delegate_to_claude_cli(
-                    f"用户问了这个问题，请简洁回答（中文）：\n\n{text}",
-                    workspace,
-                    timeout_sec=120,
-                )
-                if result.success and result.output:
-                    _emit(emit, f"[{brain.name} 回答]\n{result.output[:3000]}")
-                    actions.append({
-                        "name": "cognitive_outsource",
-                        "detail": f"Delegated to {brain.name}, got answer ({len(result.output)} chars)",
-                    })
-                    _user_answered = True
-        except Exception:
-            pass  # Outsourcing must never crash offline brain
-
-    if not _user_answered and text:
-        _emit(
-            emit,
-            f"[离线脑] 抱歉，当前无法用AI回答你的问题「{text[:100]}」。"
-            "原因：云端API无额度，本地Ollama未连接，外部CLI也不可用。"
-            "请充值API或启动Ollama (ollama serve) 后再试。",
-        )
 
     episode = append_reasoning_episode(
         workspace,
