@@ -31,6 +31,11 @@ from claw_runtime.cognitive_outsourcing import (
     probe_environment,
     save_brain_registry,
 )
+from claw_runtime.self_intelligence import (
+    ActionOutcome,
+    build_intelligence_prompt,
+    record_action,
+)
 from claw_runtime.memory import append_memory
 from claw_runtime.offline_brain import run_offline_brain
 from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
@@ -771,6 +776,14 @@ def dev_claw_run(
             "5. 如果某个子任务失败，分析原因后决定：重试 / 跳过 / 进一步拆解。\n"
             "记住：你是项目经理，不是码农。先规划，再执行。"
         )
+        # --- Self-Intelligence: inject learned wisdom from past experiences ---
+        try:
+            _intel_prompt = build_intelligence_prompt(workspace_path)
+            if _intel_prompt:
+                base_core += _intel_prompt
+        except Exception:
+            pass
+
         # --- Cognitive Outsourcing: probe for external brains and inject consciousness ---
         try:
             _ext_brains = probe_environment(workspace_path)
@@ -1074,6 +1087,22 @@ def dev_claw_run(
                 _emit("[结果] " + name + "\n" + preview[:4000] + ("…" if len(preview) > 4000 else ""))
 
                 log_tool(workspace_path, i, name, args, str(tool_result))
+
+                # Record action for self-intelligence learning
+                try:
+                    _is_success = "error" not in str(tool_result).lower()[:500] and "失败" not in str(tool_result)[:500]
+                    record_action(workspace_path, ActionOutcome(
+                        timestamp=__import__("time").time(),
+                        action_type="tool_call",
+                        tool_name=name,
+                        instruction_summary=json.dumps(args, ensure_ascii=False)[:200],
+                        success=_is_success,
+                        tokens_used=0,
+                        time_sec=0,
+                        model_used=model if not parasite else f"parasite:{model}",
+                    ))
+                except Exception:
+                    pass
 
                 messages.append(
                     {
