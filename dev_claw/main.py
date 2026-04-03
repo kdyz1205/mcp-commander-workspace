@@ -270,20 +270,28 @@ def web_fetch(url: str) -> str:
         return f"web_fetch 失败: {e!s}"
 
 
-def _probe_compatible_backend(base_url: str, *, timeout: float = 3.0) -> tuple[bool, str]:
+def _probe_compatible_backend(base_url: str, *, timeout: float = 8.0) -> tuple[bool, str]:
+    """Probe with generous timeout — high memory systems need more time."""
     probe_url = base_url.rstrip("/") + "/models"
     req = Request(probe_url, headers={"User-Agent": "DevClaw-parasite-probe/1.0"}, method="GET")
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            return True, f"HTTP {getattr(resp, 'status', 200)}"
-    except HTTPError as exc:
-        if exc.code in {401, 403, 404, 405}:
-            return True, f"HTTP {exc.code}"
-        return False, f"HTTPError {exc.code}: {exc.reason}"
-    except URLError as exc:
-        return False, f"URLError: {exc.reason}"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc!s}"
+    # Try multiple times — on high-memory systems, first attempt often fails
+    for attempt in range(3):
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                return True, f"HTTP {getattr(resp, 'status', 200)}"
+        except HTTPError as exc:
+            if exc.code in {401, 403, 404, 405}:
+                return True, f"HTTP {exc.code}"
+            if attempt < 2:
+                import time as _time; _time.sleep(1)
+                continue
+            return False, f"HTTPError {exc.code}: {exc.reason}"
+        except (URLError, Exception) as exc:
+            if attempt < 2:
+                import time as _time; _time.sleep(1)
+                continue
+            return False, f"{type(exc).__name__}: {exc!s}"
+    return False, "probe failed after 3 attempts"
 
 
 def use_browser_stub(task_prompt: str) -> str:
@@ -882,7 +890,7 @@ def dev_claw_run(
 
             try:
                 if parasite:
-                    probe_timeout = min(3.0, max(1.0, request_timeout / 2.0))
+                    probe_timeout = max(8.0, request_timeout / 2.0)  # Generous timeout for high-memory systems
                     ok, detail = _probe_compatible_backend(parasite_base_url or "", timeout=probe_timeout)
                     if not ok and _offline_brain_enabled():
                         _emit(f"[寄生脑] 本地兼容端点预探测失败（{detail}），直接转离线研究脑。")

@@ -325,6 +325,10 @@ def main() -> int:
 
     _register_bot_commands(bot)
 
+    class _FastPathDone(Exception):
+        """Signal that fast-path handled the message, skip tool loop."""
+        pass
+
     def worker() -> None:
         while True:
             channel, chat_id, instruction, request_id = task_q.get()
@@ -396,9 +400,7 @@ def main() -> int:
                             except Exception:
                                 pass
                         if _answered:
-                            worker_busy.clear()
-                            task_q.task_done()
-                            continue  # Skip the full tool loop
+                            raise _FastPathDone()  # Jump to finally, skip tool loop
                         # If all failed, fall through to full dev_claw_run
 
                     # ── Full tool loop for complex tasks ──
@@ -437,6 +439,8 @@ def main() -> int:
                             request_id=request_id,
                             kind="complete",
                         )
+                except _FastPathDone:
+                    pass  # Fast-path handled it, skip to finally
                 except Exception as e:  # noqa: BLE001
                     try:
                         append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
@@ -526,6 +530,10 @@ def main() -> int:
             "执行", "execute", "运行", "run", "测试", "test",
             "分析", "analyze", "扫描", "scan", "交易", "trade",
             "搜索", "search", "抓取", "fetch", "安装", "install",
+            "读取", "read", "检查", "check", "修改", "modify", "改进", "improve",
+            "写入", "write", "删除", "delete", "更新", "update",
+            "代码", "code", "文件", "file", "项目", "project",
+            "学习", "learn", "进化", "evolve", "优化", "optimize",
         )
         _is_task = any(kw in text.lower() for kw in _task_keywords)
         _is_short = len(text) < 150
@@ -581,13 +589,25 @@ def main() -> int:
                 return
 
         elif _is_task and (not assessment or not assessment.should_decompose):
-            # TIER 2: Medium tasks → Claude CLI first (high quality), fallback tool loop
-            _dispatch_reply(channel, chat_id, "收到，调用高级大脑处理中…", request_id=request_id)
+            # TIER 2: Medium tasks
+            # If it needs ACTUAL file/code operations → full tool loop (can use tools)
+            _needs_tools = any(kw in text.lower() for kw in (
+                "读取", "read", "写入", "write", "修改", "modify", "检查", "check",
+                "文件", "file", "代码", "code", "执行", "execute", "运行", "run",
+                "改进", "improve", "优化", "optimize", "进化", "evolve",
+                "自己", "self", "学习", "learn",
+            ))
+            if _needs_tools:
+                # Must go through tool loop for actual operations
+                _dispatch_reply(channel, chat_id, "收到，执行中…", request_id=request_id)
+                task_q.put((channel, chat_id, text, request_id))
+                return
+            # Pure reasoning/analysis → Claude CLI is enough
+            _dispatch_reply(channel, chat_id, "收到，调用高级大脑…", request_id=request_id)
             answer = _ask_claude(text, 120)
             if answer:
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
-            # Fall through to full tool loop if Claude CLI fails
             task_q.put((channel, chat_id, text, request_id))
             return
 
