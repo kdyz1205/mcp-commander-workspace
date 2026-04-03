@@ -27,6 +27,11 @@ except ImportError:
 
 from claw_runtime.memory import append_memory
 from claw_runtime.offline_brain import run_offline_brain
+from claw_runtime.task_complexity_detector import (
+    intercept_if_grand,
+    on_consecutive_failures,
+    pop_next_atom_task,
+)
 from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
 from claw_runtime.session_log import log_tool
 from claw_runtime.skill_registry import SkillRegistry
@@ -583,7 +588,12 @@ def dev_claw_run(
             "安装技能：CLI `py -m claw_runtime.cli skills-install <url|路径>` 或（高风险）"
             "DEVCLAW_ALLOW_SKILL_INSTALL=1 后调用 install_claw_skill。"
             "终端可在 Docker 内执行：claw.config.json sandbox.docker.enabled 或 DEVCLAW_USE_DOCKER_SANDBOX=1。"
-            "多阶段编排：py -m claw_runtime.cli multi-agent …"
+            "多阶段编排：py -m claw_runtime.cli multi-agent …\n"
+            "\n【任务复杂度嗅探】系统内置了任务复杂度检测器（task_complexity_detector）。"
+            "当收到宏大/模糊任务（如'重构整个项目'、'开发新系统'）时，系统会自动拦截并拆解为原子任务队列。"
+            "你应该专注于当前阶段的工作，不要试图一次完成所有事情。"
+            "如果连续失败 2 次，系统会强制进入推理模式，在 task_plan.md 中写下逻辑分析。"
+            "如果发现知识盲区（连续失败 3+ 次），系统会自动调用 research_lab 搜索解决方案。"
         )
         if survival.jailbreak_escalated():
             base_core += (
@@ -598,9 +608,31 @@ def dev_claw_run(
             base_core = base_core + "\n\n" + system_append.strip()
 
         catalog = registry.catalog_text() if skills_on else "## Skills\n(disabled via DEVCLAW_SKILLS=0)\n"
+
+        # ── Task Complexity Detector: intercept grand tasks ──
+        decomposition_plan = intercept_if_grand(
+            workspace_path,
+            user_instruction,
+            emit=_emit if progress_hook else None,
+        )
+        active_instruction = user_instruction
+        if decomposition_plan:
+            # Grand task intercepted → rewrite instruction to first atom task
+            first_atom = decomposition_plan.atom_tasks[0]
+            active_instruction = (
+                f"[自动拆解阶段 1/{len(decomposition_plan.atom_tasks)}] {first_atom.title}\n"
+                f"{first_atom.description}\n\n"
+                f"原始任务背景: {user_instruction[:500]}\n\n"
+                "注意: 只完成当前阶段的工作。完成后系统会自动从工作队列取出下一阶段。"
+            )
+            _emit(
+                f"老板，任务太大，我已经自动将其拆分为 {len(decomposition_plan.atom_tasks)} 个阶段"
+                "并排入我的工作队列。我现在开始执行阶段一。"
+            )
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": base_core + "\n\n" + catalog},
-            {"role": "user", "content": user_instruction},
+            {"role": "user", "content": active_instruction},
         ]
 
         survival_gate = os.environ.get("DEVCLAW_SURVIVAL_GATE", "1").strip().lower() not in {
@@ -608,6 +640,10 @@ def dev_claw_run(
             "false",
             "no",
         }
+
+        # Track consecutive failures within this run for failure-triggered reasoning
+        _consecutive_fail_count = 0
+        _last_error_text = ""
 
         for i in range(max_iterations):
             survival.heartbeat()
@@ -694,6 +730,21 @@ def dev_claw_run(
                 _survival_record_api_error(workspace_path, e)
                 if qt and quota_platform:
                     qt.record_usage(quota_platform, was_rate_limited=True)
+
+                # ── Failure-triggered reasoning (consecutive fail >= 2) ──
+                _consecutive_fail_count += 1
+                _last_error_text = str(e)[:500]
+                reasoning_path = on_consecutive_failures(
+                    workspace_path,
+                    active_instruction,
+                    _consecutive_fail_count,
+                    _last_error_text,
+                )
+                if reasoning_path:
+                    _emit(
+                        f"[推理引擎] 连续失败 {_consecutive_fail_count} 次，"
+                        f"已在 task_plan.md 写入 ≥50 字逻辑分析。"
+                    )
 
                 reflex_db = float(os.environ.get("DEVCLAW_REFLEX_DEBOUNCE_SEC", "60") or "60")
                 tg_notify = (lambda t: _emit(t)) if progress_hook else None
@@ -789,7 +840,33 @@ def dev_claw_run(
                 print("\n[DevClaw 最终汇报]:\n")
                 final_text = response_message.content or ""
                 print(final_text)
-                _emit("[完成]\n" + (final_text or "（模型未返回文本）"))
+
+                # ── Queue-driven self-dispatch: check for next atom task ──
+                next_task = pop_next_atom_task(workspace_path)
+                if next_task:
+                    phase_info = next_task.get("meta", {})
+                    phase_num = phase_info.get("phase", "?")
+                    total = phase_info.get("total_phases", "?")
+                    next_title = phase_info.get("title", "")
+                    _emit(
+                        f"[完成阶段 {phase_num - 1 if isinstance(phase_num, int) and phase_num > 1 else '?'}/{total}]\n"
+                        + (final_text or "（模型未返回文本）")
+                        + f"\n\n🔄 工作队列中还有任务。自动开始阶段 {phase_num}: {next_title}"
+                    )
+                    # Recursively execute next atom task
+                    next_instruction = next_task.get("text", "")
+                    if next_instruction and _resume_depth < 5:
+                        exit_success = dev_claw_run(
+                            next_instruction,
+                            max_iterations=max_iterations,
+                            system_append=system_append,
+                            progress_hook=progress_hook,
+                            _resume_depth=_resume_depth + 1,
+                        )
+                        return exit_success
+                else:
+                    _emit("[完成]\n" + (final_text or "（模型未返回文本）"))
+
                 exit_success = True
                 return True
 

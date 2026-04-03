@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from claw_runtime.bot_task_queue import persisted_queue_depth, pop_persisted_tasks
 from claw_runtime.memory import append_memory
 from claw_runtime.reasoning_episode import append_reasoning_episode, maybe_auto_reasoning_stub
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
@@ -160,6 +161,32 @@ class ReasoningOptimizer:
 def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> dict[str, Any]:
     ws = Path(workspace).resolve()
     actions: list[dict[str, Any]] = []
+
+    # ── Queue-driven self-dispatch: prioritize atom tasks from the queue ──
+    queue_depth = persisted_queue_depth(ws)
+    if queue_depth > 0 and _env_bool("META_QUEUE_AUTO_DISPATCH", default=True):
+        pending = pop_persisted_tasks(ws, max_n=1)
+        for task_rec in pending:
+            if task_rec.get("kind") == "atom_task":
+                meta = task_rec.get("meta", {})
+                phase = meta.get("phase", "?")
+                total = meta.get("total_phases", "?")
+                title = meta.get("title", "unknown")
+                task_text = task_rec.get("text", "")
+                actions.append({
+                    "name": "queue_auto_dispatch",
+                    "detail": f"Phase {phase}/{total}: {title}",
+                    "task_text": task_text[:500],
+                })
+                # Override task_intent with the queued atom task
+                task_intent = task_text[:500]
+                append_memory(
+                    ws,
+                    "decision",
+                    f"[meta_tick] 自动从工作队列取出原子任务: 阶段 {phase}/{total} — {title}",
+                )
+                break
+
     eng = SurvivalEngine(ws)
     eng.heartbeat()
     fund_note = eng.autonomous_fund_check()
@@ -353,6 +380,11 @@ def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> di
                 except Exception as e:  # noqa: BLE001
                     actions.append({"name": "evolve_draft_error", "detail": str(e)[:500]})
 
+    # ── Report remaining queue depth ──
+    remaining_queue = persisted_queue_depth(ws)
+    if remaining_queue > 0:
+        actions.append({"name": "queue_status", "detail": f"{remaining_queue} atom tasks remaining in queue"})
+
     out: dict[str, Any] = {
         "ts": time.time(),
         "task_intent": task_intent,
@@ -361,6 +393,7 @@ def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> di
         "snapshot": snap,
         "decision": asdict(decision),
         "actions": actions,
+        "queue_depth": remaining_queue,
     }
     _append_tick_log(ws, out)
     return out
