@@ -43,6 +43,13 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+# Auto-load .env file if present (critical for TG_BOT_TOKEN, API keys, etc.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_REPO_ROOT, ".env"), override=False)
+except ImportError:
+    pass
+
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
