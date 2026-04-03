@@ -142,10 +142,12 @@ def run_offline_brain(
         if not _user_answered:
             try:
                 import subprocess
+                import shutil
+                _ollama_bin = shutil.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
                 for model_cmd in ("gemma3:4b", "qwen2.5-coder:3b", "gemma4:latest"):
                     try:
                         r = subprocess.run(
-                            ["ollama", "run", model_cmd, text[:2000]],
+                            [_ollama_bin, "run", model_cmd, text[:2000]],
                             capture_output=True, text=True, timeout=60,
                             encoding="utf-8", errors="replace",
                         )

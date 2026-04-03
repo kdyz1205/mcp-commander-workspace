@@ -344,20 +344,80 @@ def main() -> int:
                     time.sleep(2)
                 merged = _merged_system_append(instruction) or system_append
                 try:
+                    # ── Fast-path: simple chat → answer directly via Ollama/Claude CLI ──
+                    # Don't waste 5 minutes on the full tool loop for "你在干嘛"
+                    _is_simple_chat = len(instruction) < 200 and not any(
+                        kw in instruction.lower()
+                        for kw in (
+                            "重构", "refactor", "修复", "fix", "写代码", "write code",
+                            "部署", "deploy", "创建", "create", "开发", "develop",
+                            "执行", "execute", "运行", "run", "测试", "test",
+                            "分析", "analyze", "扫描", "scan", "交易", "trade",
+                        )
+                    )
 
-                    # Internal noise filter: don't spam user with maintenance logs
-                    _INTERNAL_PREFIXES = (
+                    if _is_simple_chat:
+                        _answered = False
+                        # Try Ollama subprocess directly (fastest, most reliable)
+                        try:
+                            import subprocess as _sp
+                            import shutil as _sh
+                            _ollama_bin = _sh.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
+                            for _model in ("gemma3:4b", "qwen2.5-coder:3b"):
+                                try:
+                                    _r = _sp.run(
+                                        [_ollama_bin, "run", _model, instruction],
+                                        capture_output=True, text=True, timeout=30,
+                                        encoding="utf-8", errors="replace",
+                                    )
+                                    if _r.returncode == 0 and _r.stdout.strip():
+                                        _dispatch_reply(channel, chat_id, _r.stdout.strip()[:4000], request_id=request_id, kind="progress")
+                                        _answered = True
+                                        break
+                                except (_sp.TimeoutExpired, FileNotFoundError):
+                                    continue
+                        except Exception:
+                            pass
+                        # Try Claude CLI if Ollama failed
+                        if not _answered:
+                            try:
+                                import subprocess as _sp
+                                _r = _sp.run(
+                                    ["claude", "--print", "--dangerously-skip-permissions", instruction],
+                                    capture_output=True, text=True, timeout=60,
+                                    cwd=str(ws_path), encoding="utf-8", errors="replace",
+                                )
+                                if _r.returncode == 0 and _r.stdout.strip():
+                                    _dispatch_reply(channel, chat_id, _r.stdout.strip()[:4000], request_id=request_id, kind="progress")
+                                    _answered = True
+                            except Exception:
+                                pass
+                        if _answered:
+                            worker_busy.clear()
+                            task_q.task_done()
+                            continue  # Skip the full tool loop
+                        # If all failed, fall through to full dev_claw_run
+
+                    # ── Full tool loop for complex tasks ──
+                    # Strict noise filter: only final answers reach the user
+                    _INTERNAL_NOISE = (
                         "[离线动作]", "[离线降级脑]", "[自愈准备]",
                         "[工具]", "[结果]", "[配额", "[生存 ",
                         "DevClaw 启动", "工作区:", "通道:", "模型:",
-                        "[寄生脑]",
+                        "[寄生脑]", "[完成]\n离线", "[停止]",
+                        "[🧠 认知外包]", "[Fallback]",
+                        "离线降级脑已完成", "动作:\n-",
                     )
 
                     def hook(msg: str) -> None:
-                        # Filter: only send user-facing messages to TG
                         stripped = msg.strip()
-                        if any(stripped.startswith(p) for p in _INTERNAL_PREFIXES):
-                            return  # Swallow internal noise
+                        if any(stripped.startswith(p) for p in _INTERNAL_NOISE):
+                            return
+                        # Also filter multi-line maintenance summaries
+                        if "self_heal:" in stripped or "skill_synthesis:" in stripped or "treasury_proposal:" in stripped:
+                            return
+                        if "reasoning_episode:" in stripped:
+                            return
                         _dispatch_reply(channel, chat_id, msg, request_id=request_id, kind="progress")
 
                     dev_claw_run(
