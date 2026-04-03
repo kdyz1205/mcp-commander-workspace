@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from claw_runtime.bot_task_queue import persisted_queue_depth, pop_persisted_tasks
+from claw_runtime.bot_task_queue import enqueue_persisted_task, persisted_queue_depth, pop_persisted_tasks
 from claw_runtime.memory import append_memory
 from claw_runtime.reasoning_episode import append_reasoning_episode, maybe_auto_reasoning_stub
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
@@ -185,7 +185,14 @@ def autonomous_tick(workspace: Path | str, task_intent: str | None = None) -> di
                     "decision",
                     f"[meta_tick] 自动从工作队列取出原子任务: 阶段 {phase}/{total} — {title}",
                 )
-                break
+            else:
+                # Not an atom task — re-enqueue so it isn't lost
+                enqueue_persisted_task(
+                    ws,
+                    kind=task_rec.get("kind", "unknown"),
+                    text=task_rec.get("text", ""),
+                    meta=task_rec.get("meta"),
+                )
 
     eng = SurvivalEngine(ws)
     eng.heartbeat()
