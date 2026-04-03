@@ -385,7 +385,20 @@ def main() -> int:
                 request_id=request_id,
             )
             return
-        _dispatch_reply(channel, chat_id, "已入队，DevClaw 开始处理…", request_id=request_id)
+        # Prefrontal cortex: check if task needs auto-decomposition before queuing
+        try:
+            from claw_runtime.task_complexity_detector import assess_complexity
+            assessment = assess_complexity(text, workspace=ws_path)
+            if assessment.should_decompose:
+                _dispatch_reply(
+                    channel, chat_id,
+                    f"🧠 检测到宏大任务 (复杂度 {assessment.score}/10)，将自动拆解后执行...",
+                    request_id=request_id,
+                )
+            else:
+                _dispatch_reply(channel, chat_id, "已入队，DevClaw 开始处理…", request_id=request_id)
+        except Exception:
+            _dispatch_reply(channel, chat_id, "已入队，DevClaw 开始处理…", request_id=request_id)
         task_q.put((channel, chat_id, text, request_id))
 
     def survival_heartbeat_loop() -> None:
@@ -425,6 +438,16 @@ def main() -> int:
                             t = (item.get("text") or "").strip()
                             if t:
                                 task_q.put(("tg", primary_chat_hb, t, None))
+                    except Exception:
+                        pass
+                    # Smart queue: pull next runnable decomposed task
+                    try:
+                        from claw_runtime.bot_task_queue import SmartTaskRegistry
+                        smart_reg = SmartTaskRegistry(ws_path)
+                        next_task = smart_reg.next_runnable()
+                        if next_task and not worker_busy.is_set() and task_q.empty():
+                            task_q.put(("tg", primary_chat_hb, next_task.instruction, None))
+                            smart_reg.mark_running(next_task.task_id)
                     except Exception:
                         pass
                 st, _reason = eng.assess_survival_state()

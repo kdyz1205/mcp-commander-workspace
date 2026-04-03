@@ -25,6 +25,7 @@ try:
 except ImportError:
     OpenAI = None  # type: ignore[assignment]
 
+from claw_runtime.bot_task_queue import SmartTaskRegistry
 from claw_runtime.memory import append_memory
 from claw_runtime.offline_brain import run_offline_brain
 from claw_runtime.sandbox_docker import docker_enabled, run_shell_in_docker
@@ -33,6 +34,8 @@ from claw_runtime.skill_registry import SkillRegistry
 from claw_runtime.quota_tracker import QuotaTracker
 from claw_runtime.survival_engine import SurvivalEngine, SurvivalState
 from claw_runtime.survival_reflex import run_critical_reflex
+from claw_runtime.task_complexity_detector import assess_complexity
+from claw_runtime.task_decomposer import decompose_and_enqueue
 from claw_runtime.ultimate.nomad import load_nomad_system_append
 from claw_runtime.ultimate.proxy_env import (
     apply_proxy_env,
@@ -403,6 +406,32 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "decompose_task",
+            "description": "将一个复杂宏大的任务拆解为多个原子子任务并排入执行队列。当你发现任务太大无法一次完成时使用。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {"type": "string", "description": "需要拆解的宏大任务描述"},
+                    "context": {"type": "string", "description": "额外上下文信息（可选）"},
+                },
+                "required": ["instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_task_queue",
+            "description": "查看当前智能任务队列状态：待执行、执行中、已完成、失败的任务列表。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "install_claw_skill",
             "description": "从 URL(zip) 或本地路径安装技能到 skills/<name>/。需环境变量 DEVCLAW_ALLOW_SKILL_INSTALL=1。",
             "parameters": {
@@ -436,6 +465,95 @@ def _assistant_to_dict(msg: Any) -> dict[str, Any]:
     return d
 
 
+def _run_self_driving_queue(
+    workspace_path: Path,
+    *,
+    max_iterations: int = 16,
+    system_append: str | None = None,
+    progress_hook: Callable[[str], None] | None = None,
+    max_tasks: int = 50,
+) -> bool:
+    """
+    Self-driving queue executor: pulls and executes tasks from SmartTaskRegistry
+    until the queue is empty or max_tasks is reached.
+
+    This is the "foreman" loop that makes DevClaw autonomous.
+    """
+    def _emit(text: str) -> None:
+        if progress_hook:
+            progress_hook(text)
+
+    registry = SmartTaskRegistry(workspace_path)
+    completed = 0
+    failed = 0
+
+    for task_num in range(max_tasks):
+        task = registry.next_runnable()
+        if task is None:
+            # Check if there are still pending tasks (blocked)
+            summary = registry.queue_summary()
+            if summary.get("pending", 0) > 0:
+                _emit(
+                    f"[⏳ 队列阻塞] 还有 {summary['pending']} 个待执行任务，"
+                    f"但它们被依赖关系阻塞。已完成: {completed}, 失败: {failed}"
+                )
+            else:
+                _emit(
+                    f"[✅ 队列清空] 所有子任务执行完毕！"
+                    f"完成: {completed}, 失败: {failed}"
+                )
+            break
+
+        # Mark task as running
+        registry.mark_running(task.task_id)
+        _emit(
+            f"\n[📌 子任务 {task_num + 1}] [{task.task_id[:8]}] Phase {task.phase}\n"
+            f"{task.instruction[:200]}"
+        )
+
+        # Execute the sub-task
+        try:
+            sub_append = (
+                f"\n\n[子任务上下文] 你正在执行自动拆解后的子任务 (ID: {task.task_id[:8]})。"
+                f"完成当前任务即可，不要尝试执行其他子任务。"
+                f"如果遇到困难，在 task_plan.md 中记录并继续。"
+            )
+            if system_append:
+                sub_append = system_append + sub_append
+
+            success = dev_claw_run(
+                task.instruction,
+                max_iterations=max_iterations,
+                system_append=sub_append,
+                progress_hook=progress_hook,
+                _resume_depth=1,  # prevent recursive decomposition
+            )
+
+            if success:
+                registry.mark_done(task.task_id, result_summary="completed successfully")
+                completed += 1
+                _emit(f"[✅ 子任务完成] [{task.task_id[:8]}] ({completed} done, {failed} failed)")
+            else:
+                registry.mark_failed(task.task_id, error="execution returned False")
+                failed += 1
+                _emit(f"[❌ 子任务失败] [{task.task_id[:8]}] retry {task.retries}/{task.max_retries}")
+
+        except Exception as exc:
+            registry.mark_failed(task.task_id, error=str(exc)[:500])
+            failed += 1
+            _emit(f"[❌ 子任务异常] [{task.task_id[:8]}] {exc!s}")
+
+    # Final summary
+    summary = registry.queue_summary()
+    _emit(
+        f"\n[📋 执行总结] 完成: {completed} | 失败: {failed} | "
+        f"剩余待执行: {summary.get('pending', 0)} | "
+        f"队列状态:\n{registry.format_queue_status()}"
+    )
+
+    return failed == 0 and summary.get("pending", 0) == 0
+
+
 def dev_claw_run(
     user_instruction: str,
     max_iterations: int = 16,
@@ -461,6 +579,40 @@ def dev_claw_run(
     survival = SurvivalEngine(workspace_path)
     exit_success = False
     proxy_snapshot = snapshot_proxy_env()
+
+    # ── Prefrontal Cortex: Task Complexity Interception ──────────────
+    # If the task is too complex, auto-decompose into sub-tasks and
+    # enqueue them instead of executing directly.
+    _decompose_gate = os.environ.get("DEVCLAW_AUTO_DECOMPOSE", "1").strip().lower() not in {
+        "0", "false", "no",
+    }
+    if _decompose_gate and _resume_depth == 0:
+        try:
+            assessment = assess_complexity(user_instruction, workspace=workspace_path)
+            if assessment.should_decompose:
+                _emit(
+                    f"[🧠 前额叶拦截] 检测到宏大任务 (复杂度 {assessment.score}/10)。"
+                    f"禁止直接执行，启动自动拆解..."
+                )
+                was_decomposed, report, task_ids = decompose_and_enqueue(
+                    user_instruction,
+                    workspace_path,
+                    progress_hook=progress_hook,
+                )
+                if was_decomposed and task_ids:
+                    _emit(report)
+                    # Now run the self-driving queue to execute sub-tasks
+                    _emit("[🚀 自驱动模式] 开始从任务队列中逐个执行子任务...")
+                    return _run_self_driving_queue(
+                        workspace_path,
+                        max_iterations=max_iterations,
+                        system_append=system_append,
+                        progress_hook=progress_hook,
+                    )
+        except Exception as exc:
+            # Decomposition failed; fall through to normal execution
+            _emit(f"[⚠️ 拆解引擎异常] {exc!s}，回退到直接执行模式")
+    # ── End Prefrontal Cortex ────────────────────────────────────────
 
     try:
         apply_proxy_env(workspace_path)
@@ -583,7 +735,15 @@ def dev_claw_run(
             "安装技能：CLI `py -m claw_runtime.cli skills-install <url|路径>` 或（高风险）"
             "DEVCLAW_ALLOW_SKILL_INSTALL=1 后调用 install_claw_skill。"
             "终端可在 Docker 内执行：claw.config.json sandbox.docker.enabled 或 DEVCLAW_USE_DOCKER_SANDBOX=1。"
-            "多阶段编排：py -m claw_runtime.cli multi-agent …"
+            "多阶段编排：py -m claw_runtime.cli multi-agent …\n\n"
+            "【包工头智力 — Task Decomposition Protocol】\n"
+            "你拥有任务拆解的自主判断力。当收到宏大模糊任务（如'重构整个项目'、'开发一个新系统'）时：\n"
+            "1. **禁止直接开始写代码**。先用 decompose_task 工具将任务拆解为原子子任务。\n"
+            "2. 每个原子任务只涉及 1-3 个文件，能在 16 次工具调用内完成。\n"
+            "3. 拆解后的子任务会自动排入智能队列，按依赖顺序逐个执行。\n"
+            "4. 用 check_task_queue 查看当前队列状态和进度。\n"
+            "5. 如果某个子任务失败，分析原因后决定：重试 / 跳过 / 进一步拆解。\n"
+            "记住：你是项目经理，不是码农。先规划，再执行。"
         )
         if survival.jailbreak_escalated():
             base_core += (
@@ -827,6 +987,17 @@ def dev_claw_run(
                     )
                 elif name == "safety_scan_file":
                     tool_result = safety_scan_relative_file(args.get("filepath", ""))
+                elif name == "decompose_task":
+                    _was_decomposed, _decompose_report, _task_ids = decompose_and_enqueue(
+                        args.get("instruction", user_instruction),
+                        workspace_path,
+                        progress_hook=progress_hook,
+                        context=args.get("context", ""),
+                    )
+                    tool_result = _decompose_report
+                elif name == "check_task_queue":
+                    _smart_reg = SmartTaskRegistry(workspace_path)
+                    tool_result = _smart_reg.format_queue_status()
                 elif name == "install_claw_skill":
                     if os.environ.get("DEVCLAW_ALLOW_SKILL_INSTALL", "").strip().lower() not in {
                         "1",
