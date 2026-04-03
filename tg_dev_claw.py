@@ -608,7 +608,7 @@ def main() -> int:
         """
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
         tick = int(os.environ.get("SURVIVAL_TICK_SEC", "60") or "60")
-        debounce = float(os.environ.get("SURVIVAL_REFLEX_DEBOUNCE_SEC", "300") or "300")
+        debounce = float(os.environ.get("SURVIVAL_REFLEX_DEBOUNCE_SEC", "3600") or "3600")  # 1 hour debounce — don't spam user
         try:
             admin_chats_hb = sorted(int(x) for x in admins)
             primary_chat_hb = admin_chats_hb[0]
@@ -622,11 +622,7 @@ def main() -> int:
                 control = _control_state()
                 if control.background_master_enabled:
                     try:
-                        fund_note = eng.autonomous_fund_check()
-                        if fund_note:
-                            _broadcast_admins(
-                                "[生存引擎] 低资金估算 — 已写入 .claw/persisted_tasks.jsonl\n" + fund_note[:500],
-                            )
+                        eng.autonomous_fund_check()  # Silent — don't spam user
                     except Exception:
                         pass
                 if primary_chat_hb is not None and control.accepting_tasks and control.background_master_enabled and not worker_busy.is_set():
@@ -1140,7 +1136,8 @@ def main() -> int:
 
     print("TG DevClaw 监听中… 工作区:", os.environ.get("DEVCLAW_WORKSPACE"))
     print("管理员 chat id:", ", ".join(sorted(admins)))
-    _broadcast_admins("DevClaw 已启动。\n\n" + _control_panel_text())
+    # Don't spam user with startup messages - only log locally
+    # _broadcast_admins("DevClaw 已启动。\n\n" + _control_panel_text())
     bot.infinity_polling(skip_pending=True, interval=1, timeout=60)
     return 0
 
