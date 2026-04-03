@@ -57,6 +57,28 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# Auto-start Ollama service if not running (critical for parasite mode)
+def _ensure_ollama_running() -> None:
+    import subprocess as _sp
+    try:
+        _sp.run("curl -s http://127.0.0.1:11434/api/tags", shell=True,
+                capture_output=True, timeout=3)
+    except Exception:
+        # Ollama not running, try to start it
+        for candidate in (
+            os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe"),
+            "ollama",
+        ):
+            try:
+                _sp.Popen([candidate, "serve"], stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+                print(f"[startup] Auto-started Ollama: {candidate}", file=sys.stderr)
+                import time as _time; _time.sleep(3)
+                break
+            except (OSError, FileNotFoundError):
+                continue
+
+_ensure_ollama_running()
+
 try:
     import telebot
     from telebot import types

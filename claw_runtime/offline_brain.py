@@ -194,6 +194,46 @@ def run_offline_brain(
         actions.append({"name": "nomad_snapshot", "detail": str(nomad)})
         _emit(emit, f"[离线动作] 已写入 nomad snapshot: {nomad.name}")
 
+    # --- Cognitive Outsourcing: try to answer the user's actual question ---
+    # The offline brain's maintenance actions above are necessary for survival,
+    # but the user ALSO asked a question. Try to answer it via external brains.
+    _user_answered = False
+    if text and not text.startswith("["):
+        try:
+            from claw_runtime.cognitive_outsourcing import (
+                delegate_to_claude_cli,
+                probe_environment,
+                select_brain,
+                CAP_SIMPLE_CHAT,
+                CAP_COMPLEX_REASONING,
+            )
+            brains = probe_environment(workspace)
+            brain = select_brain(CAP_SIMPLE_CHAT, brains) or select_brain(CAP_COMPLEX_REASONING, brains)
+            if brain and brain.name == "claude":
+                _emit(emit, f"[认知外包] 离线脑智商不足，委派 {brain.name} 回答用户问题...")
+                result = delegate_to_claude_cli(
+                    f"用户问了这个问题，请简洁回答（中文）：\n\n{text}",
+                    workspace,
+                    timeout_sec=120,
+                )
+                if result.success and result.output:
+                    _emit(emit, f"[{brain.name} 回答]\n{result.output[:3000]}")
+                    actions.append({
+                        "name": "cognitive_outsource",
+                        "detail": f"Delegated to {brain.name}, got answer ({len(result.output)} chars)",
+                    })
+                    _user_answered = True
+        except Exception:
+            pass  # Outsourcing must never crash offline brain
+
+    if not _user_answered and text:
+        _emit(
+            emit,
+            f"[离线脑] 抱歉，当前无法用AI回答你的问题「{text[:100]}」。"
+            "原因：云端API无额度，本地Ollama未连接，外部CLI也不可用。"
+            "请充值API或启动Ollama (ollama serve) 后再试。",
+        )
+
     episode = append_reasoning_episode(
         workspace,
         trigger="offline_brain",
