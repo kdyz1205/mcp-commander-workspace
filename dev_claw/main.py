@@ -534,8 +534,8 @@ def _run_via_claude_cli(
         result = subprocess.run(
             [
                 claude_bin,
-                "--print",
                 "--dangerously-skip-permissions",
+                "-p",
                 f"你是DevClaw超级智能体。在工作区 {workspace_path} 中执行以下任务：\n\n{user_instruction}",
             ],
             capture_output=True,

@@ -355,9 +355,11 @@ def main() -> int:
                     try:
                         import shutil as _wsh
                         _claude_bin = _wsh.which("claude") or "claude"
+                        # Use -p flag (not --print) — this lets Claude Code use its FULL
+                        # tool chain (read/write files, run commands, etc.)
                         _wr = _wsp.run(
-                            [_claude_bin, "--print", "--dangerously-skip-permissions", instruction[:3000]],
-                            capture_output=True, text=True, timeout=180,
+                            [_claude_bin, "--dangerously-skip-permissions", "-p", instruction[:3000]],
+                            capture_output=True, text=True, timeout=300,  # 5 min for real tasks
                             cwd=str(ws_path), encoding="utf-8", errors="replace",
                         )
                         if _wr.returncode == 0 and _wr.stdout.strip():
@@ -541,11 +543,11 @@ def main() -> int:
 
         def _ask_claude(prompt, timeout=60):
             """High-quality brain via Claude CLI (user subscription, FREE).
-            Claude CLI has FULL tool access — it can read/write files, run commands, etc."""
+            Uses -p flag for full tool access (read/write files, run commands)."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
                 _r = _sp.run(
-                    [_claude_path, "--print", "--dangerously-skip-permissions", prompt[:3000]],
+                    [_claude_path, "--dangerously-skip-permissions", "-p", prompt[:3000]],
                     capture_output=True, text=True, timeout=timeout,
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )

@@ -266,7 +266,7 @@ def delegate_to_claude_cli(
     # Use --dangerously-skip-permissions to avoid interactive prompts
     cmd_parts = [
         "claude",
-        "--print",
+        "-p",
         "--dangerously-skip-permissions",
     ]
 
