@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 
 from core.vitals import calculate_ttl, get_vitals_summary
+from core.metabolic_kernel import calculate_psi, psi_gate, PsiSnapshot
 from core.mcp_server import ToolRegistry
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [HEARTBEAT] %(message)s')
@@ -105,47 +106,92 @@ class DevClawSupervisor:
 
     def run_single_cycle(self) -> dict:
         """Run one heartbeat cycle. Returns status dict."""
-        ttl = calculate_ttl(self.balance_path)
-        mode, directive = self.decide_strategy(ttl)
+        ws = Path(self.backlog_path).parent.resolve()
+
+        # ── Ψ: Survival Pressure — the master control variable ──
+        psi = calculate_psi(ws, balance_path=self.balance_path)
+        ttl = psi.ttl_days
+        mode = psi.mode  # PREDATOR / BALANCED / EXPLORER
         vitals = get_vitals_summary(self.balance_path)
 
-        logging.info(f"{vitals} | MODE: {mode}")
+        logging.info(f"{vitals} | Ψ={psi.psi:.2f} | MODE: {mode}")
 
         result = {
             "ttl": ttl,
+            "psi": psi.psi,
             "mode": mode,
-            "directive": directive,
             "action_taken": None,
         }
 
-        if mode == "SURVIVAL":
-            result["action_taken"] = "survival_scan"
-            logging.info("SURVIVAL: 快死了！只找赚钱任务...")
-            # In survival, PROFIT tasks first. CRITICAL_EVOLUTION also allowed.
+        # ── 3-strike emergency: no profit in 3 cycles → self-diagnostic ──
+        if not hasattr(self, "_no_profit_streak"):
+            self._no_profit_streak = 0
+
+        if mode == "PREDATOR":
+            # Ψ > 0.8: 掠食者模式 — 只做赚钱的事
+            result["action_taken"] = "predator_hunt"
+            logging.info(f"PREDATOR (Ψ={psi.psi:.2f}): 停止科研，全力续命！")
             task = self.get_next_backlog_task(prefer_type="PROFIT")
             if task:
                 self._execute_task(task, result)
+                self._no_profit_streak = 0
             else:
-                # No profit tasks — try profit_hunter skill directly
-                logging.info("SURVIVAL: No PROFIT tasks, running profit_hunter scan...")
+                logging.info("PREDATOR: No PROFIT tasks, running profit_hunter scan...")
                 self._execute_task("扫描套利机会（funding rate + DEX 价差），找到就报告", result)
+                self._no_profit_streak += 1
 
-        elif mode == "BALANCE":
+            # 3-strike: force self-diagnostic
+            if self._no_profit_streak >= 3:
+                logging.warning("PREDATOR: 3 cycles without profit! Emergency self-diagnostic.")
+                self._auto_survival_task(ws)
+                self._no_profit_streak = 0
+
+        elif mode == "BALANCED":
+            # Ψ 0.4~0.8: 平衡模式
             task = self.get_next_backlog_task()
             if task:
-                self._execute_task(task, result)
+                # Gate: check if task type is allowed at current Ψ
+                allowed, reason, _ = psi_gate(ws, task_type="general")
+                if allowed:
+                    self._execute_task(task, result)
+                else:
+                    logging.info(f"PSI_GATE blocked: {reason}")
+                    # Fall back to profit task
+                    profit_task = self.get_next_backlog_task(prefer_type="PROFIT")
+                    if profit_task:
+                        self._execute_task(profit_task, result)
+                    else:
+                        result["action_taken"] = "gated_idle"
             else:
                 result["action_taken"] = "idle_optimization"
 
-        elif mode == "RESEARCH":
+        elif mode == "EXPLORER":
+            # Ψ < 0.4: 探索者模式 — 可以用顶级算力
             task = self.get_next_backlog_task()
             if task:
                 self._execute_task(task, result)
             else:
                 result["action_taken"] = "self_optimization"
-                logging.info("RESEARCH: No backlog tasks, optimizing self...")
+                logging.info("EXPLORER: No backlog tasks, optimizing self...")
 
         return result
+
+    def _auto_survival_task(self, workspace: Path) -> None:
+        """Auto-add SURVIVAL task to backlog when 3 cycles yield no profit."""
+        try:
+            bl = Path(self.backlog_path)
+            content = bl.read_text(encoding="utf-8") if bl.is_file() else ""
+            marker = "[SURVIVAL] 紧急自检"
+            if marker not in content:
+                task = f"- [PROFIT] {marker}：分析为什么连续3轮无盈利，重写低效模块以节省资源"
+                content = content.replace(
+                    "## Active Tasks\n",
+                    f"## Active Tasks\n{task}\n",
+                )
+                bl.write_text(content, encoding="utf-8")
+                logging.info(f"AUTO-SURVIVAL: Added emergency task to backlog")
+        except Exception as e:
+            logging.error(f"AUTO-SURVIVAL failed: {e}")
 
     def _execute_task(self, task: str, result: dict) -> None:
         """
