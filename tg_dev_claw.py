@@ -220,19 +220,20 @@ def _send_chunks(bot: telebot.TeleBot, chat_id: int, text: str) -> None:
 def _register_bot_commands(bot: telebot.TeleBot) -> None:
     """Telegram 侧「菜单」命令（长按 / 或侧栏可见）。"""
     cmds = [
-        types.BotCommand("start", "欢迎与快速说明"),
+        types.BotCommand("start", "欢迎 + 像素家园总览"),
         types.BotCommand("help", "全部命令说明"),
-        types.BotCommand("whoami", "查看本聊天 ID（配置 TG_ADMIN_CHAT_IDS）"),
-        types.BotCommand("ping", "存活检测"),
+        types.BotCommand("home", "像素家园 — Skills / Organs / 任务看板"),
+        types.BotCommand("skills", "列出全部已注册技能"),
+        types.BotCommand("backlog", "查看进化任务队列"),
+        types.BotCommand("vitals", "TTL / 余额 / 生存状态"),
         types.BotCommand("status", "队列与工作区状态"),
         types.BotCommand("panel", "运行控制面板"),
         types.BotCommand("pause", "暂停接任务和自主循环"),
-        types.BotCommand("resume", "恢复接任务和自主循环"),
+        types.BotCommand("resume", "恢复开工"),
         types.BotCommand("sim", "锁定 simulation only"),
-        types.BotCommand("cancel", "取消说明（单 worker 版）"),
-        types.BotCommand("vitals", "生存引擎快照（心跳/配额/寄生）"),
-        types.BotCommand("parasite_off", "关闭寄生模式标记"),
-        types.BotCommand("evolve", "从失败日志生成草稿 SKILL（需人工审）"),
+        types.BotCommand("evolve", "失败日志 → 草稿 SKILL"),
+        types.BotCommand("whoami", "查看 chat_id"),
+        types.BotCommand("ping", "存活检测"),
     ]
     try:
         bot.set_my_commands(cmds)
@@ -1077,6 +1078,134 @@ def main() -> int:
 
     # ---- 命令处理器（勿用纯 content_types=text 抢 /start）----
 
+    @bot.message_handler(commands=["home"])
+    def cmd_home(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        try:
+            from core.vitals import calculate_ttl
+            ttl = calculate_ttl(str(ws_path / ".auth" / "balance.json"))
+            bal_data = json.loads((ws_path / ".auth" / "balance.json").read_text("utf-8"))
+            bal = float(bal_data.get("balance", 0))
+            bmr = float(bal_data.get("bmr", 1))
+        except Exception:
+            ttl, bal, bmr = 0.5, 0, 1
+        mode = "HEALTHY" if ttl > 30 else "BALANCE" if ttl > 7 else "SURVIVAL"
+        bar_len = 15
+        filled = min(int(ttl / 60 * bar_len), bar_len)
+        hp_bar = "█" * filled + "░" * (bar_len - filled)
+
+        # Skills count
+        try:
+            sdata = json.loads((ws_path / "skills" / "skills.json").read_text("utf-8"))
+            skill_count = len(sdata.get("skills", []))
+        except Exception:
+            skill_count = 0
+
+        # Runners count
+        runners = list((ws_path / "skills").glob("*/runner.py"))
+
+        # Backlog
+        try:
+            bl = (ws_path / "EVOLUTION_BACKLOG.md").read_text("utf-8")
+            active = len([l for l in bl.splitlines() if l.strip().startswith("- [ ]") or l.strip().startswith("- [RESEARCH]") or l.strip().startswith("- [PROFIT]")])
+            done = len([l for l in bl.splitlines() if "[DONE]" in l or "- [x]" in l])
+        except Exception:
+            active, done = 0, 0
+
+        text = (
+            "🏠 D E V C L A W   H O M E\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"♥ TTL  [{hp_bar}] {ttl:.0f}d\n"
+            f"💰 BAL  ${bal:.2f}  |  BMR ${bmr:.2f}/d\n"
+            f"⚡ MODE  {mode}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⌂ Skills: {skill_count}  |  ⚙ Organs: {len(runners)}\n"
+            f"📋 Tasks: {active} pending / {done} done\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "   ╔══════════╗\n"
+            "   ║  ◉    ◉  ║\n"
+            "   ║    ▽    ║\n"
+            "   ║  ╰───╯  ║\n"
+            "   ╚══╦══╦══╝\n"
+            "  ╔══╝  ╚══╗\n"
+            "  ║ ≡≡≡  ≡≡≡ ║\n"
+            "  ╚════════════╝\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            '"I think, therefore I trade."'
+        )
+        bot.reply_to(message, text)
+
+    @bot.message_handler(commands=["skills"])
+    def cmd_skills(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        try:
+            sdata = json.loads((ws_path / "skills" / "skills.json").read_text("utf-8"))
+            skills = sdata.get("skills", [])
+        except Exception:
+            skills = []
+        if not skills:
+            bot.reply_to(message, "暂无已注册技能。")
+            return
+        icons = {
+            "trading": "📈", "profit": "💰", "treasury": "🏦",
+            "compute": "⚡", "refactor": "🔧", "gene": "🧬",
+            "logic": "💊", "survival": "🛡", "sys_info": "🖥",
+            "market": "🔭", "proxy": "🌐", "meta": "🧠",
+            "evolution": "🧪", "dex": "📡", "funding": "💹",
+            "correlation": "📊", "ultimate": "🚀", "web_agent": "🕸",
+            "digital": "👷",
+        }
+        lines = ["⌂ DevClaw 技能清单\n━━━━━━━━━━━━━━━━━━━━━━━━"]
+        for s in skills:
+            icon = "📦"
+            for k, v in icons.items():
+                if k in s["id"]:
+                    icon = v
+                    break
+            lines.append(f"{icon} {s['id']}  —  {s['title']}")
+        # Runners
+        runners = sorted(p.parent.name for p in (ws_path / "skills").glob("*/runner.py"))
+        lines.append(f"\n⚙ Active Organs ({len(runners)}):")
+        lines.append("  ".join(runners))
+        bot.reply_to(message, "\n".join(lines))
+
+    @bot.message_handler(commands=["backlog"])
+    def cmd_backlog(message: telebot.types.Message) -> None:
+        cid = str(message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
+            return
+        try:
+            bl = (ws_path / "EVOLUTION_BACKLOG.md").read_text("utf-8")
+        except Exception:
+            bot.reply_to(message, "无法读取 EVOLUTION_BACKLOG.md")
+            return
+        active_lines = []
+        done_count = 0
+        for line in bl.splitlines():
+            s = line.strip()
+            if s.startswith("- [ ]") or s.startswith("- [RESEARCH]") or s.startswith("- [PROFIT]"):
+                active_lines.append(s)
+            elif "[DONE]" in s or s.startswith("- [x]"):
+                done_count += 1
+        text = "📋 Evolution Backlog\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        if active_lines:
+            text += "🔴 Active:\n"
+            for l in active_lines[:10]:
+                text += f"  {l}\n"
+            if len(active_lines) > 10:
+                text += f"  ...+{len(active_lines)-10} more\n"
+        else:
+            text += "✅ 无待处理任务\n"
+        text += f"\n✅ Completed: {done_count}"
+        bot.reply_to(message, text)
+
     @bot.message_handler(commands=["whoami"])
     def cmd_whoami(message: telebot.types.Message) -> None:
         uid = message.from_user.id if message.from_user else "?"
@@ -1243,20 +1372,23 @@ def main() -> int:
             return
         bot.reply_to(
             message,
-            "DevClaw TG 网关\n\n"
-            "命令：\n"
-            "/start /help — 本说明\n"
-            "/whoami — 查看 chat_id\n"
-            "/ping — 在线检测\n"
+            "🏠 DevClaw TG 网关\n\n"
+            "━━ 总览 ━━\n"
+            "/home — 像素家园（Skills/Organs/任务看板）\n"
+            "/skills — 列出全部已注册技能\n"
+            "/backlog — 进化任务队列\n"
+            "/vitals — TTL / 余额 / 生存状态\n\n"
+            "━━ 运维 ━━\n"
             "/status — 队列与工作区\n"
-            "/panel — 控制面板\n"
+            "/panel — 运行控制面板\n"
             "/pause — 暂停接任务和自主循环\n"
-            "/resume — 恢复接任务和自主循环\n"
-            "/sim — 锁定 simulation only\n"
-            "/cancel — 取消说明\n"
-            "/vitals — 生存引擎快照\n"
-            "/parasite_off — 关闭寄生模式\n"
+            "/resume — 恢复开工\n"
+            "/sim — 锁定 simulation only\n\n"
+            "━━ 进化 ━━\n"
             "/evolve — 失败日志 → 草稿 SKILL\n\n"
+            "━━ 工具 ━━\n"
+            "/whoami — 查看 chat_id\n"
+            "/ping — 存活检测\n\n"
             f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
             f"最大迭代: {max_iters}\n"
             f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n"
