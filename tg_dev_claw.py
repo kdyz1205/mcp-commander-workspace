@@ -909,6 +909,75 @@ def main() -> int:
                 return
             # If Claude CLI also fails, fall through to worker queue
 
+        # ── TIER 0.5: HARDWIRED EXECUTOR — bypass LLM, execute Python directly ──
+        # When user says "跑策略/扫描/回测/交易/模拟买入", don't ask LLM.
+        # LLM will write an essay. Instead, import and run the skill.
+        _hardwire_kw = any(kw in text for kw in (
+            "跑策略", "扫描", "回测", "套利", "执行策略", "开始赚钱",
+            "跑各种", "模拟买", "模拟卖", "模拟交易", "paper trade",
+            "run strategy", "run scan", "backtest", "start trading",
+            "profit hunt", "funding rate", "资金费率",
+        ))
+        if _hardwire_kw:
+            _dispatch_reply(channel, chat_id, "⚡ 硬接线执行中（绕过LLM，直接跑Python脚本）…", request_id=request_id)
+            _hw_results = []
+            # 1. Profit Hunter scan
+            try:
+                sys.path.insert(0, str(ws_path)) if str(ws_path) not in sys.path else None
+                from skills.profit_hunter.runner import main as _ph_main
+                _ph_out = _ph_main()
+                _hw_results.append(f"【套利扫描】\n{str(_ph_out)[:1500]}")
+            except Exception as _phe:
+                _hw_results.append(f"【套利扫描失败】{_phe!s}"[:300])
+            # 2. Paper trade demo (simulate $500 USDC → SOL)
+            try:
+                from pathlib import Path as _HwPath
+                from skills.sk_trade_executor.executor import TradeExecutor, TradingMode
+                _hw_exec = TradeExecutor(_HwPath(str(ws_path)), mode=TradingMode.SIMULATION)
+                _hw_trade = _hw_exec.execute_swap(
+                    "USDC", "So11111111111111111111111111111111111111112", 500,
+                    max_slippage=0.03, reason="hardwired auto-trade",
+                )
+                if _hw_trade.success:
+                    _hw_results.append(
+                        f"【模拟交易成功】\n"
+                        f"  500 USDC → {_hw_trade.amount_out:.4f} SOL\n"
+                        f"  价格: ${_hw_trade.price:.2f} | 滑点: {_hw_trade.slippage:.2%}\n"
+                        f"  Tx: {_hw_trade.tx_id}"
+                    )
+                else:
+                    _hw_results.append(f"【模拟交易拒绝】{_hw_trade.error or 'slippage/balance'}")
+            except Exception as _te:
+                _hw_results.append(f"【交易引擎异常】{_te!s}"[:300])
+            # 3. Virtual wallet status
+            try:
+                from core.virtual_wallet import VirtualWallet
+                _hw_wallet = VirtualWallet(_HwPath(str(ws_path)))
+                _hw_bal = _hw_wallet.get_all_balances()
+                _hw_summary = _hw_wallet.get_portfolio_summary()
+                _bal_lines = " | ".join(f"{k}: {v}" for k, v in _hw_bal.items() if v != 0)
+                _hw_results.append(
+                    f"【虚拟钱包】{_bal_lines}\n"
+                    f"  总交易: {_hw_summary.get('trade_count', 0)} | PnL: ${_hw_summary.get('total_pnl', 0):.2f}"
+                )
+            except Exception as _we:
+                _hw_results.append(f"【钱包异常】{_we!s}"[:200])
+            # 4. Ψ survival pressure
+            try:
+                from core.metabolic_kernel import calculate_psi
+                _hw_psi = calculate_psi(_HwPath(str(ws_path)))
+                _hw_results.append(
+                    f"【生存压强】Ψ={_hw_psi.psi:.2f} ({_hw_psi.mode}) | "
+                    f"TTL={_hw_psi.ttl_days}天 | 余额=${_hw_psi.balance_usd}"
+                )
+            except Exception:
+                pass
+
+            _hw_reply = "\n\n".join(_hw_results) if _hw_results else "所有技能执行失败"
+            _add_to_history(chat_id, "assistant", _hw_reply[:500])
+            _dispatch_reply(channel, chat_id, _hw_reply[:4000], request_id=request_id)
+            return
+
         # ── Messages that MUST NOT go to Ollama ──
         # Token addresses, monitoring requests, anything with crypto addresses
         # These cause Ollama to hallucinate "ok I'll monitor" without doing anything.
