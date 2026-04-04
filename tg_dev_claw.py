@@ -499,6 +499,10 @@ def main() -> int:
         text = (text or "").strip()
         if not text:
             return
+        # Truncate excessively long messages to prevent OOM/timeout
+        if len(text) > 3000:
+            _dispatch_reply(channel, chat_id, f"消息太长（{len(text)}字符），已截断到3000字符处理。", request_id=request_id)
+            text = text[:3000]
         control_outcome = interpret_control_message(ws_path, text, actor=actor)
         if control_outcome is not None:
             _dispatch_reply(channel, chat_id, control_outcome.reply, request_id=request_id)
