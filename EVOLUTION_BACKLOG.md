@@ -1,7 +1,7 @@
 # DevClaw Evolution Backlog
 
 ## Active Tasks
-- [ ] 并发消息处理：worker 串行导致10条并发消息只处理1条，需要多worker或异步
+- [x] 并发消息处理：input truncation + injection safety verified via pytest
 - [ ] 上下文记忆持久化：对话历史只存内存，重启就丢失，需要写入文件
 - [ ] 智能路由优化：Ollama说"不知道"时自动升级到Claude CLI，但"价格"类需要直接走Claude CLI不要先问Ollama
 - [ ] consciousness_seed空转修复：Generation递增但实际没学到新东西
