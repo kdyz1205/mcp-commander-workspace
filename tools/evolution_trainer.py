@@ -42,44 +42,33 @@ def clean(text):
 
 
 def chat(msg, max_wait=120):
-    """Send message to DevClaw and wait for COMPLETE response.
-    Waits for [complete] signal, not just any output — ensures the task is fully done."""
+    """Send message to DevClaw and wait for ANY meaningful response."""
     rid = enqueue_operator_message(WS, msg, chat_id=0, source="evolution_trainer")
     start = time.time()
     outbox = os.path.join(WS, ".claw/operator_outbox.jsonl")
-    last_progress = None
+    _noise = ("已入队", "收到", "执行中", "调用", "思考中", "处理中")
 
     for _ in range(max_wait // 2):
         time.sleep(2)
         try:
-            lines = open(outbox, encoding="utf-8").readlines()
-            complete = False
-            for ln in lines:
+            best = None
+            for ln in open(outbox, encoding="utf-8").readlines():
                 d = json.loads(ln.strip())
                 if d.get("id") != rid:
                     continue
-                kind = d.get("kind", "")
                 t = clean(d.get("text", ""))
-                if kind == "progress" and t and len(t) > 10:
-                    last_progress = t[:800]
-                if kind == "complete":
-                    complete = True
-            if complete and last_progress:
-                return last_progress, round(time.time() - start, 1)
-            # For simple chat (no tool loop), reply is the answer
-            if complete and not last_progress:
-                for ln in lines:
-                    d = json.loads(ln.strip())
-                    if d.get("id") == rid and d.get("kind") == "reply":
-                        t = clean(d.get("text", ""))
-                        if t and len(t) > 10 and all(x not in t for x in ["已入队", "收到", "执行中", "调用"]):
-                            return t[:800], round(time.time() - start, 1)
+                if not t or len(t) < 5:
+                    continue
+                if any(t.startswith(n) for n in _noise):
+                    continue
+                # Keep the longest meaningful response
+                if best is None or len(t) > len(best):
+                    best = t[:800]
+            if best:
+                return best, round(time.time() - start, 1)
         except Exception:
             pass
 
-    # Timeout — return whatever we got
-    if last_progress:
-        return last_progress, round(time.time() - start, 1)
     return None, max_wait
 
 
