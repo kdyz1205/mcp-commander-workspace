@@ -639,7 +639,7 @@ def _try_llm_rule_generation(
 
     # Try Claude CLI first
     for cmd in (
-        ["claude", "--print", "-p", prompt],
+        ["claude", "-p", prompt],
         ["ollama", "run", "llama3", prompt],
     ):
         exe = cmd[0]

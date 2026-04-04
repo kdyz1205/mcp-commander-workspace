@@ -65,7 +65,7 @@ def _think_deep(prompt: str, timeout: int = 120) -> str:
     """Use Claude CLI for deep thinking (user subscription, free)."""
     try:
         r = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", prompt],
+            ["claude", "-p", "--dangerously-skip-permissions", prompt],
             capture_output=True, text=True, timeout=timeout,
             encoding="utf-8", errors="replace",
         )
@@ -257,11 +257,17 @@ def act_1_self_awareness(ws: Path) -> dict[str, Any]:
     """
     ws = Path(ws).resolve()
 
-    # Gather self-knowledge
-    state = {}
-
-    # What model am I running?
-    state["brain"] = "gemma3:4b (local)"
+    # Gather self-knowledge — initialize with defaults so the dict is always complete
+    state: dict[str, Any] = {
+        "brain": "gemma3:4b (local)",
+        "consecutive_failures": 0,
+        "api_events_count": 0,
+        "skill_count": 0,
+        "iq": 50,
+        "learned_rules": 0,
+        "generation": 0,
+        "external_brains": [],
+    }
 
     # What's my health?
     try:
@@ -452,6 +458,16 @@ def act_4_execute_improvement(ws: Path, plans: list[dict[str, str]]) -> list[str
                     actions_taken.append(f"Added rule to .cursorrules: {rule[:80]}")
             except Exception:
                 pass
+
+    # Increment generation counter on every improvement execution
+    if actions_taken:
+        profile_path = _claw(ws) / "intelligence_profile.json"
+        try:
+            profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.is_file() else {}
+            profile["generation"] = profile.get("generation", 0) + 1
+            profile_path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     _log_thought(ws, "improvement_actions", json.dumps(actions_taken, ensure_ascii=False))
     return actions_taken

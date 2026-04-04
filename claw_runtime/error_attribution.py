@@ -163,7 +163,7 @@ def _try_claude_cli(prompt: str) -> Optional[dict[str, Any]]:
     """Attempt diagnosis via Claude CLI (free tier)."""
     try:
         result = subprocess.run(
-            ["claude", "--print", "-p", prompt],
+            ["claude", "-p", prompt],
             capture_output=True,
             text=True,
             timeout=30,
