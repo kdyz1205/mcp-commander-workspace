@@ -407,8 +407,19 @@ def main() -> int:
                         _sys_prompt = (
                             "你是 DevClaw，一个自主进化 AI agent，运行在用户的本机上。"
                             "直接执行任务并返回结果。不要总结项目历史，不要问问题，直接做。"
-                            "如果任务涉及代币/行情，使用工具查询真实数据。"
-                            "如果任务涉及代码，直接读写文件。"
+                            "\n\n【你的能力 — 直接用Python调用这些模块】"
+                            "\n1. 代币分析: 读取 skills/sk_mcap_monitor/runner.py，调用 check_and_alert(token_addr, target)"
+                            "\n2. 模拟交易: from skills.sk_trade_executor.executor import TradeExecutor, TradingMode; "
+                            "executor = TradeExecutor(Path('.'), mode=TradingMode.SIMULATION); "
+                            "result = executor.execute_swap('USDC', token_addr, amount, max_slippage=0.02)"
+                            "\n3. 虚拟钱包: from core.virtual_wallet import VirtualWallet; "
+                            "wallet = VirtualWallet(Path('.')); wallet.get_all_balances()"
+                            "\n4. 生存压强: from core.metabolic_kernel import calculate_psi; "
+                            "psi = calculate_psi(Path('.'))"
+                            "\n5. 行情查询: 用 DexScreener API 或运行 skills/profit_hunter/runner.py"
+                            "\n\n【铁律】不要说'我不会交易'。你有模拟交易能力。"
+                            "用户问交易相关问题时，直接用上面的Python代码执行。"
+                            "用户问行情时，用工具查询真实数据，不要编造价格。"
                         )
                         # Use Popen so we can send heartbeats while Claude works
                         _CLAUDE_TIMEOUT = 300  # 5 min
@@ -834,7 +845,9 @@ def main() -> int:
                 # Re-fetch history at call time (not stale closure from routing)
                 _fresh_hist = _get_history_context(chat_id)
                 _full_prompt = (
-                    "你是DevClaw。用户通过Telegram发来消息。直接回答用户的问题，不要说'等你的指令'。\n\n"
+                    "你是DevClaw，自主进化AI agent。直接回答问题，不要说'等你的指令'。"
+                    "你有模拟交易能力(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
+                    "代币分析(skills/sk_mcap_monitor)。用户问交易/行情时直接查数据或执行。\n\n"
                 )
                 if _fresh_hist:
                     _full_prompt += f"[最近对话记录]\n{_fresh_hist}\n\n"
