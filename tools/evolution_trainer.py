@@ -42,26 +42,38 @@ def clean(text):
 
 
 def chat(msg, max_wait=120):
-    """Send message to DevClaw and wait for ANY meaningful response."""
-    rid = enqueue_operator_message(WS, msg, chat_id=0, source="evolution_trainer")
-    start = time.time()
+    """Send message to DevClaw and wait for ANY meaningful response.
+    Records outbox line count BEFORE sending so we only check NEW lines."""
     outbox = os.path.join(WS, ".claw/operator_outbox.jsonl")
     _noise = ("已入队", "收到", "执行中", "调用", "思考中", "处理中")
+
+    # Snapshot outbox size before sending
+    try:
+        before_count = sum(1 for _ in open(outbox, encoding="utf-8"))
+    except (FileNotFoundError, OSError):
+        before_count = 0
+
+    rid = enqueue_operator_message(WS, msg, chat_id=0, source="evolution_trainer")
+    start = time.time()
 
     for _ in range(max_wait // 2):
         time.sleep(2)
         try:
+            lines = open(outbox, encoding="utf-8").readlines()
+            # Only check lines AFTER our message was sent
+            new_lines = lines[before_count:]
             best = None
-            for ln in open(outbox, encoding="utf-8").readlines():
+            for ln in new_lines:
+                if not ln.strip():
+                    continue
                 d = json.loads(ln.strip())
                 if d.get("id") != rid:
                     continue
                 t = clean(d.get("text", ""))
-                if not t or len(t) < 5:
+                if not t or len(t) < 8:
                     continue
                 if any(t.startswith(n) for n in _noise):
                     continue
-                # Keep the longest meaningful response
                 if best is None or len(t) > len(best):
                     best = t[:800]
             if best:
