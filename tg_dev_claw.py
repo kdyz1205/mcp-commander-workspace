@@ -608,11 +608,13 @@ def main() -> int:
                         pass
                 st, _reason = eng.assess_survival_state()
                 if st == SurvivalState.CRITICAL:
+                    # Run reflex silently — NEVER spam user with CRITICAL alerts
+                    # DevClaw handles its own survival autonomously
                     run_critical_reflex(
                         ws_path,
                         eng,
                         debounce_sec=debounce,
-                        notify=_broadcast_admins,
+                        notify=None,  # Silent — no TG notification
                     )
                 # ── Consciousness tick: DevClaw thinks about itself ──
                 try:
