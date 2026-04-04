@@ -319,6 +319,45 @@ class DevClawSupervisor:
             logging.error(f"EXECUTION ERROR: {e}")
             result["action_taken"] = f"error: {e!s}"
 
+            # ── PAIN → SELF-HEAL: Exception = survival threat ──
+            try:
+                from core.self_healer import heal
+                ws_path = Path(ws)
+                heal_result = heal(ws_path, e, context=f"Task: {task[:100]}")
+                if heal_result.healed:
+                    logging.info(f"SELF-HEALED: {heal_result.fix_description}")
+                    result["action_taken"] = f"self_healed: {task[:40]}"
+                    result["heal"] = {
+                        "healed": True,
+                        "attempts": heal_result.total_attempts,
+                    }
+                else:
+                    # Escalate: add CRITICAL_FIX task to backlog
+                    self._escalate_pain(e, task)
+                    result["heal"] = {
+                        "healed": False,
+                        "attempts": heal_result.total_attempts,
+                    }
+            except Exception as heal_err:
+                logging.error(f"SELF-HEAL ENGINE FAILED: {heal_err}")
+
+    def _escalate_pain(self, error: Exception, task: str) -> None:
+        """Convert unhealed error into a CRITICAL_FIX backlog task."""
+        try:
+            bl = Path(self.backlog_path)
+            content = bl.read_text(encoding="utf-8") if bl.is_file() else ""
+            err_summary = f"{type(error).__name__}: {str(error)[:100]}"
+            fix_task = f"- [CRITICAL_EVOLUTION] 自愈失败，人工干预: {err_summary} (原任务: {task[:60]})"
+            if err_summary not in content:
+                content = content.replace(
+                    "## Active Tasks\n",
+                    f"## Active Tasks\n{fix_task}\n",
+                )
+                bl.write_text(content, encoding="utf-8")
+                logging.warning(f"PAIN ESCALATED to backlog: {err_summary[:80]}")
+        except Exception as e:
+            logging.error(f"ESCALATION FAILED: {e}")
+
     def run_daemon(self):
         """
         Infinite life loop. The heartbeat that never stops.
