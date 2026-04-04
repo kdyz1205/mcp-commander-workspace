@@ -6,10 +6,29 @@ Trading PnL is not wired here; use SurvivalState / consecutive_failures as coars
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
 from typing import Any
+
+_MAX_REASONING_ENTRIES = 20
+_MAX_TASK_PLAN_BYTES = 50_000
+
+
+def _content_hash(hypothesis: str, verify_plan: list[str]) -> str:
+    blob = hypothesis + "|".join(verify_plan)
+    return hashlib.md5(blob.encode()).hexdigest()[:12]
+
+
+def _trim_old_entries(text: str, max_entries: int) -> str:
+    """Keep only the last `max_entries` reasoning episodes."""
+    marker = "### 推理片段"
+    parts = text.split(marker)
+    if len(parts) <= max_entries + 1:
+        return text
+    kept = parts[0] + marker + (marker).join(parts[-(max_entries):])
+    return kept
 
 
 def append_reasoning_episode(
@@ -20,29 +39,40 @@ def append_reasoning_episode(
     verify_plan: list[str],
     revise_hint: str = "",
 ) -> Path:
-    """Append one markdown episode to task_plan.md (create minimal file if missing)."""
+    """Append one markdown episode to task_plan.md (create minimal file if missing).
+    Deduplicates by content hash and caps at _MAX_REASONING_ENTRIES."""
     workspace = Path(workspace).resolve()
     path = workspace / "task_plan.md"
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
     checks = "\n".join(f"- {x}" for x in verify_plan) if verify_plan else "- （待补充可执行检查步骤）"
+    chash = _content_hash(hypothesis, verify_plan)
     block = f"""
 
-### 推理片段 [{ts}] — {trigger[:120]}
+### 推理片段 [{ts}] — {trigger[:120]} <!-- h:{chash} -->
 
-**假设（Hypothesis）:**  
+**假设（Hypothesis）:**
 {hypothesis}
 
-**待验证（Verify）:**  
+**待验证（Verify）:**
 {checks}
 
-**若证伪则修正（Revise）:**  
+**若证伪则修正（Revise）:**
 {revise_hint or "（由下一轮 DevClaw 根据工具输出填写：改参数 / 换技能 / 加风控）"}
 
 ---
 """
     if path.is_file():
         existing = path.read_text(encoding="utf-8", errors="replace")
-        path.write_text(existing + block, encoding="utf-8")
+        # Deduplicate: skip if same content hash already present
+        if f"h:{chash}" in existing:
+            return path
+        text = existing + block
+        # Cap entries
+        text = _trim_old_entries(text, _MAX_REASONING_ENTRIES)
+        # Hard cap on file size
+        if len(text.encode("utf-8")) > _MAX_TASK_PLAN_BYTES:
+            text = _trim_old_entries(text, _MAX_REASONING_ENTRIES // 2)
+        path.write_text(text, encoding="utf-8")
     else:
         path.write_text(
             "# Task plan\n\n> 由 reasoning_episode 自动追加；请与仓库模板对齐后整理。\n" + block,

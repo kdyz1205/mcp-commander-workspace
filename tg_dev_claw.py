@@ -335,9 +335,9 @@ def main() -> int:
                     _dispatch_reply(
                         channel,
                         chat_id,
-                        “收到暂停指令，当前任务已挂起，等待你发送”开始干活”或 /resume 再继续。”,
+                        '收到暂停指令，当前任务已挂起，等待你发送"开始干活"或 /resume 再继续。',
                         request_id=request_id,
-                        kind=”status”,
+                        kind="status",
                     )
                     pause_notice_sent = True
                 time.sleep(2)
@@ -436,7 +436,7 @@ def main() -> int:
     def _control_panel_text() -> str:
         return (
             panel_summary(_control_state())
-            + "\n- 说明: 自然语言可直接说“开始干活”“暂停”“只模拟交易”“控制面板”。"
+            + '\n- 说明: 自然语言可直接说"开始干活""暂停""只模拟交易""控制面板"。'
         )
 
     def _handle_text_input(
@@ -461,7 +461,7 @@ def main() -> int:
             _dispatch_reply(
                 channel,
                 chat_id,
-                "当前处于暂停/静默状态，暂不接新任务。发送“开始干活”或 /resume 可恢复。\n\n" + panel_summary(control),
+                '当前处于暂停/静默状态，暂不接新任务。发送"开始干活"或 /resume 可恢复。\n\n' + panel_summary(control),
                 request_id=request_id,
             )
             return
@@ -1110,7 +1110,7 @@ def main() -> int:
             f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n"
             f"空闲自检: {'开 (TG_IDLE_AUTOTICK=1)' if _env_truthy('TG_IDLE_AUTOTICK') else '关'}\n"
             f"逻辑链: {'开 (TG_AUTONOMOUS_LOGIC_CHAIN=1)' if _env_truthy('TG_AUTONOMOUS_LOGIC_CHAIN') else '关'}\n\n"
-            "自然语言也能控：例如“开始干活，检查一下仓库”“暂停”“只模拟交易”“控制面板”。\n\n"
+            '自然语言也能控：例如"开始干活，检查一下仓库""暂停""只模拟交易""控制面板"。\n\n'
             + _control_panel_text(),
         )
 
