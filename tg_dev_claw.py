@@ -325,6 +325,27 @@ def main() -> int:
 
     _register_bot_commands(bot)
 
+    # ── Conversation memory: last N exchanges per chat_id ──
+    _conv_history: dict[int, list[dict[str, str]]] = {}  # chat_id → [{role, text}]
+    _CONV_MAX = 10  # keep last 10 exchanges
+
+    def _add_to_history(chat_id: int, role: str, text: str) -> None:
+        if chat_id not in _conv_history:
+            _conv_history[chat_id] = []
+        _conv_history[chat_id].append({"role": role, "text": text[:500]})
+        _conv_history[chat_id] = _conv_history[chat_id][-_CONV_MAX:]
+
+    def _get_history_context(chat_id: int) -> str:
+        hist = _conv_history.get(chat_id, [])
+        if not hist:
+            return ""
+        lines = []
+        for h in hist[-6:]:  # last 6 messages for context
+            prefix = "用户" if h["role"] == "user" else "DevClaw"
+            lines.append(f"{prefix}: {h['text'][:200]}")
+        return "\n".join(lines)
+
+
     def worker() -> None:
         while True:
             channel, chat_id, instruction, request_id = task_q.get()
@@ -553,11 +574,19 @@ def main() -> int:
         import re as _re
         _ollama_bin = _sh.which("ollama") or os.path.expanduser("~/AppData/Local/Programs/Ollama/ollama.exe")
 
+        # Record user message in conversation history
+        _add_to_history(chat_id, "user", text)
+        _hist_ctx = _get_history_context(chat_id)
+
         def _ask_ollama(prompt, timeout=30):
-            """Fast local brain with DevClaw identity."""
+            """Fast local brain with DevClaw identity + conversation history."""
             try:
+                _full = f"[System:{_IDENTITY}]"
+                if _hist_ctx:
+                    _full += f"\n[最近对话记录]\n{_hist_ctx}"
+                _full += f"\nUser:{prompt}\nDevClaw:"
                 _r = _sp.run(
-                    [_ollama_bin, "run", "gemma3:4b", f"[System:{_IDENTITY}]\nUser:{prompt}\nDevClaw:"],
+                    [_ollama_bin, "run", "gemma3:4b", _full],
                     capture_output=True, text=True, timeout=timeout,
                     encoding="utf-8", errors="replace",
                 )
@@ -569,11 +598,14 @@ def main() -> int:
 
         def _ask_claude(prompt, timeout=60):
             """High-quality brain via Claude CLI (user subscription, FREE).
-            Uses -p flag for full tool access (read/write files, run commands)."""
+            Uses -p flag for full tool access + injects conversation history."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
+                _full_prompt = prompt[:2500]
+                if _hist_ctx:
+                    _full_prompt = f"[最近对话记录]\n{_hist_ctx}\n\n[当前任务]\n{prompt[:2500]}"
                 _r = _sp.run(
-                    [_claude_path, "--dangerously-skip-permissions", "-p", prompt[:3000]],
+                    [_claude_path, "--dangerously-skip-permissions", "-p", _full_prompt],
                     capture_output=True, text=True, timeout=timeout,
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )
@@ -588,6 +620,7 @@ def main() -> int:
             # TIER 1: Simple chat → Ollama (2-5s), fallback Claude CLI
             answer = _ask_ollama(text) or _ask_claude(text, 30)
             if answer:
+                _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
 

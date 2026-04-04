@@ -190,7 +190,12 @@ def main():
                 total_tasks += 1
 
                 say("opus", task_msg)
-                a, t = chat(task_msg, max_wait)
+                try:
+                    a, t = chat(task_msg, max_wait)
+                except Exception as exc:
+                    print(f"  {RED}✗ ERROR: {exc}{RESET}")
+                    time.sleep(5)
+                    continue
 
                 if a:
                     say("claw", a, t)
