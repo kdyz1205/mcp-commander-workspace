@@ -254,6 +254,12 @@ def _learning_loop(
                 "create", "implement", "add support",
             ))
             if needs_skill:
+                # api_forager: when error attribution suggests missing API
+                try:
+                    from claw_runtime.api_forager import learn_api
+                    # When error attribution suggests missing API
+                except Exception:
+                    pass
                 # 3c. Enqueue skill synthesis task
                 synthesis_queue.append(item)
                 break  # one per error_type

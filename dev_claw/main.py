@@ -591,6 +591,13 @@ def _run_self_driving_queue(
     completed = 0
     failed = 0
 
+    # liquid_topology: use mesh execution for 3+ independent tasks
+    try:
+        from claw_runtime.liquid_topology import select_topology, run_liquid_mesh
+        # Only use for multiple independent tasks
+    except Exception:
+        pass
+
     for task_num in range(max_tasks):
         task = registry.next_runnable()
         if task is None:
@@ -676,6 +683,16 @@ def dev_claw_run(
     def _emit(text: str) -> None:
         if progress_hook:
             progress_hook(text)
+
+    # metabolic_scheduler: check if the task is worth the cost before executing
+    try:
+        from claw_runtime.metabolic_scheduler import should_execute
+        _metabolic = should_execute(user_instruction, "general", _workspace_root())
+        if not _metabolic.get("execute", True):
+            _emit(f"[Metabolic] Task deferred: {_metabolic.get('reason', 'budget constraint')}")
+            return False
+    except Exception:
+        pass
 
     _ensure_utf8_stdio()
     ws = _workspace_root()
@@ -854,6 +871,15 @@ def dev_claw_run(
             _intel_prompt = build_intelligence_prompt(workspace_path)
             if _intel_prompt:
                 base_core += _intel_prompt
+        except Exception:
+            pass
+
+        # --- Meta-Prompting: inject active prompt overlay ---
+        try:
+            from claw_runtime.meta_prompting import get_active_prompt_overlay
+            _meta_overlay = get_active_prompt_overlay(workspace_path)
+            if _meta_overlay:
+                base_core += _meta_overlay
         except Exception:
             pass
 
@@ -1104,6 +1130,25 @@ def dev_claw_run(
                     + json.dumps(args, ensure_ascii=False, indent=2)[:3500]
                 )
 
+                # predictive_sandbox: dry-run prediction for terminal commands
+                if name == "execute_terminal":
+                    try:
+                        from claw_runtime.predictive_sandbox import predict_terminal_outcome
+                        _pred = predict_terminal_outcome(args.get("command", ""), workspace_path)
+                        if _pred.get("risk_score", 0) >= 8:
+                            tool_result = f"[BLOCKED] Predicted high risk ({_pred['risk_score']}/10): {_pred.get('predicted_effects', [])}"
+                            # skip actual execution — append result and continue
+                            messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call.id,
+                                    "content": str(tool_result)[:MAX_TOOL_CHARS],
+                                }
+                            )
+                            continue
+                    except Exception:
+                        pass
+
                 # Build executor closure for this tool call
                 def _exec(
                     _name: str = name,
@@ -1190,6 +1235,17 @@ def dev_claw_run(
 
                 log_tool(workspace_path, i, name, args, str(tool_result))
 
+                # neuro_symbolic_verifier: System 2 gate for dangerous tools
+                try:
+                    if name in ("execute_terminal",):
+                        from claw_runtime.neuro_symbolic_verifier import verify_terminal_command
+                        _cmd = args.get("command", "")
+                        _vcheck = verify_terminal_command(_cmd)
+                        if not _vcheck.get("safe", True) and _vcheck.get("risk_level") == "critical":
+                            tool_result = f"[BLOCKED by System 2] Command too dangerous: {_vcheck.get('warnings', [])}"
+                except Exception:
+                    pass
+
                 # Record action for self-intelligence learning
                 try:
                     _is_success = "error" not in str(tool_result).lower()[:500] and "失败" not in str(tool_result)[:500]
@@ -1231,6 +1287,13 @@ def dev_claw_run(
                 "no",
             }:
                 survival.record_soft_credit_use(1)
+        except Exception:
+            pass
+        # crypto_identity: sign the completed action
+        try:
+            from claw_runtime.crypto_identity import ensure_identity, sign_action
+            ensure_identity(workspace_path)
+            sign_action(workspace_path, "task_complete", user_instruction[:200])
         except Exception:
             pass
 

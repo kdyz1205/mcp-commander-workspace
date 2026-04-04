@@ -76,8 +76,11 @@ def _think_deep(prompt: str, timeout: int = 120) -> str:
     return ""
 
 
+_MAX_CONSCIOUSNESS_LOG_LINES = 200
+
+
 def _log_thought(ws: Path, thought_type: str, content: str) -> None:
-    """Write to consciousness log."""
+    """Write to consciousness log with rotation (cap at _MAX_CONSCIOUSNESS_LOG_LINES)."""
     path = _consciousness_log(ws)
     try:
         with path.open("a", encoding="utf-8") as f:
@@ -87,6 +90,14 @@ def _log_thought(ws: Path, thought_type: str, content: str) -> None:
                 "content": content[:2000],
             }
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        # Rotate if too large
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if len(lines) > _MAX_CONSCIOUSNESS_LOG_LINES:
+                kept = lines[-(_MAX_CONSCIOUSNESS_LOG_LINES // 2):]
+                path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+        except OSError:
+            pass
     except OSError:
         pass
 
@@ -372,18 +383,18 @@ def consciousness_tick(workspace: Path | str, *, emit: Callable[[str], None] | N
     except Exception:
         pass
 
+    # Write timestamp BEFORE execution to prevent duplicate runs on crash
+    try:
+        stamp_path.write_text(json.dumps({"ts": now}), encoding="utf-8")
+    except OSError:
+        pass
+
     # Run the five acts of consciousness
     state = act_1_self_awareness(ws)
     weaknesses = act_2_identify_weakness(ws, state)
     plans = act_3_plan_improvement(ws, weaknesses)
     actions = act_4_execute_improvement(ws, plans)
     act_5_update_inner_voice(ws, state, weaknesses, plans, actions)
-
-    # Update timestamp
-    try:
-        stamp_path.write_text(json.dumps({"ts": now}), encoding="utf-8")
-    except OSError:
-        pass
 
     result = {
         "status": "conscious",

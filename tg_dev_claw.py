@@ -328,34 +328,36 @@ def main() -> int:
     def worker() -> None:
         while True:
             channel, chat_id, instruction, request_id = task_q.get()
+            # Wait for resume OUTSIDE the lock to avoid blocking other threads
+            pause_notice_sent = False
+            while not _control_state().accepting_tasks:
+                if not pause_notice_sent:
+                    _dispatch_reply(
+                        channel,
+                        chat_id,
+                        “收到暂停指令，当前任务已挂起，等待你发送”开始干活”或 /resume 再继续。”,
+                        request_id=request_id,
+                        kind=”status”,
+                    )
+                    pause_notice_sent = True
+                time.sleep(2)
             with run_lock:
                 worker_busy.set()
-                pause_notice_sent = False
-                while not _control_state().accepting_tasks:
-                    if not pause_notice_sent:
-                        _dispatch_reply(
-                            channel,
-                            chat_id,
-                            "收到暂停指令，当前任务已挂起，等待你发送“开始干活”或 /resume 再继续。",
-                            request_id=request_id,
-                            kind="status",
-                        )
-                        pause_notice_sent = True
-                    time.sleep(2)
                 merged = _merged_system_append(instruction) or system_append
                 try:
                     # ── Worker brain: Claude CLI first (fast, powerful, free) ──
                     # Then fall back to dev_claw_run tool loop if Claude CLI unavailable
                     import subprocess as _wsp
                     import re as _wre
+                    import shlex as _wslx
 
                     _claude_done = False
                     try:
                         import shutil as _wsh
                         _claude_bin = _wsh.which("claude") or "claude"
                         _wr = _wsp.run(
-                            f'"{_claude_bin}" --print --dangerously-skip-permissions "{instruction[:3000]}"',
-                            capture_output=True, text=True, timeout=180, shell=True,
+                            [_claude_bin, "--print", "--dangerously-skip-permissions", instruction[:3000]],
+                            capture_output=True, text=True, timeout=180,
                             cwd=str(ws_path), encoding="utf-8", errors="replace",
                         )
                         if _wr.returncode == 0 and _wr.stdout.strip():
@@ -543,8 +545,8 @@ def main() -> int:
             try:
                 _claude_path = _sh.which("claude") or "claude"
                 _r = _sp.run(
-                    f'"{_claude_path}" --print --dangerously-skip-permissions "{prompt[:3000]}"',
-                    capture_output=True, text=True, timeout=timeout, shell=True,
+                    [_claude_path, "--print", "--dangerously-skip-permissions", prompt[:3000]],
+                    capture_output=True, text=True, timeout=timeout,
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
@@ -650,6 +652,20 @@ def main() -> int:
             time.sleep(max(15, tick))
 
     threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()
+
+    # spiking_reflexes: wire up spike detector (commented out — too resource heavy for 94% memory)
+    try:
+        from claw_runtime.spiking_reflexes import SpikeDetector, create_default_watches
+        _spike_detector = SpikeDetector(ws_path, on_spike=lambda s: _broadcast_admins(f"[Spike] {s}"))
+        for w in create_default_watches(ws_path):
+            if hasattr(w, 'symbol'):
+                _spike_detector.add_price_watch(w.symbol, w.exchange, w.threshold_pct)
+            elif hasattr(w, 'threshold_pct'):
+                _spike_detector.add_memory_watch(w.threshold_pct)
+        # Don't start yet - too resource heavy for 94% memory
+        # _spike_detector.start()
+    except Exception:
+        pass
 
     def local_operator_loop() -> None:
         while True:
