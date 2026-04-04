@@ -537,6 +537,64 @@ def main() -> int:
                 request_id=request_id,
             )
             return
+        # ── TIER -1: Direct skill invocation (pattern matching, no LLM needed) ──
+        # Detect token monitoring requests: address + number + 突破/监控/alert
+        import re as _route_re
+        _token_match = _route_re.search(r'([A-HJ-NP-Za-km-z1-9]{32,50})', text)  # Base58 chars
+        # Match number + unit AFTER the token address (avoid grabbing digits from address)
+        _text_after_token = text[_token_match.end():] if _token_match else text
+        _mcap_match = _route_re.search(r'(\d+(?:\.\d+)?)\s*(?:万|百万|M|million|美金|美元|usd|\$)', _text_after_token, _route_re.IGNORECASE)
+        _is_monitor = _token_match and _mcap_match and any(
+            kw in text for kw in ("突破", "监控", "alert", "通知", "watch", "到达", "超过", "recurring", "repeat")
+        )
+
+        if _is_monitor:
+            token_addr = _token_match.group(1)
+            raw_num = float(_mcap_match.group(1))
+            # Handle Chinese units: 万 = 10000, 百万 = 1000000
+            if "万" in text and "百万" not in text:
+                target_mcap = raw_num * 10000
+            elif "百万" in text:
+                target_mcap = raw_num * 1000000
+            elif raw_num < 1000:
+                target_mcap = raw_num * 1000000  # assume millions
+            else:
+                target_mcap = raw_num
+
+            # Launch monitor in background
+            import threading
+            def _run_bg_monitor():
+                try:
+                    sys.path.insert(0, str(ws_path)) if str(ws_path) not in sys.path else None
+                    from skills.sk_mcap_monitor.runner import check_and_alert, run_monitor_daemon
+                    from dotenv import load_dotenv
+                    load_dotenv(os.path.join(str(ws_path), ".env"), override=False)
+
+                    # First check
+                    result = check_and_alert(token_addr, target_mcap)
+                    name = result.get("token", "?")
+                    symbol = result.get("symbol", "?")
+                    mcap = result.get("mcap", 0)
+                    gap = result.get("gap", 0)
+
+                    _dispatch_reply(channel, chat_id,
+                        f"🔍 监控已启动\n"
+                        f"Token: {name} ({symbol})\n"
+                        f"当前市值: ${mcap:,.0f}\n"
+                        f"目标: ${target_mcap:,.0f}\n"
+                        f"差距: ${gap:,.0f}\n"
+                        f"每60秒检查，突破时自动通知你",
+                        request_id=request_id)
+
+                    # Run recurring monitor (blocks this thread until target hit)
+                    run_monitor_daemon(token_addr, target_mcap, interval_sec=60)
+                except Exception as e:
+                    _dispatch_reply(channel, chat_id, f"监控启动失败: {e!s}", request_id=request_id)
+
+            threading.Thread(target=_run_bg_monitor, daemon=True, name=f"mcap-{token_addr[:8]}").start()
+            _add_to_history(chat_id, "assistant", f"已启动市值监控: {token_addr[:12]}... 目标${target_mcap:,.0f}")
+            return
+
         # ── Intelligent routing: pick the right brain for the task ──
         # Simple chat → Ollama (fast, local, <5s)
         # Medium tasks → Claude CLI (user's subscription, not API, high quality)
@@ -1076,6 +1134,68 @@ def main() -> int:
 
         register_nomad_handlers(Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)))
 
+    # ---- Shared helpers for rich UI ----
+
+    _SKILL_ICONS = {
+        "trading": "📈", "profit": "💰", "treasury": "🏦",
+        "compute": "⚡", "refactor": "🔧", "gene": "🧬",
+        "logic": "💊", "survival": "🛡", "sys_info": "🖥",
+        "market": "🔭", "proxy": "🌐", "meta": "🧠",
+        "evolution": "🧪", "dex": "📡", "funding": "💹",
+        "correlation": "📊", "ultimate": "🚀", "web_agent": "🕸",
+        "digital": "👷",
+    }
+
+    _SKILL_PROMPTS = {
+        "web_agent_dex": "查一下目前热门 meme 币行情",
+        "digital_engineer_hire": "检查仓库健康度，报告待修 bug",
+        "trading": "分析当前持仓和市场状态，给出交易建议",
+        "trading_dex_pulse": "扫描 DEX 热门交易对，找异动",
+        "trading_funding_public": "查 BTC ETH 资金费率",
+        "trading_correlation_note": "分析主流币相关性，判断当前体制",
+        "ultimate_capabilities": "展示当前全部能力边界",
+        "meta_driving": "执行一轮自主进化 tick",
+        "evolution_brain": "推理下一步进化方向",
+        "proxy_rotator": "检查代理可用性并轮换",
+        "profit_hunter": "扫描套利机会（funding + DEX 价差）",
+        "treasury_ops": "展示资金看板和续费建议",
+    }
+
+    def _get_skill_icon(skill_id: str) -> str:
+        for k, v in _SKILL_ICONS.items():
+            if k in skill_id:
+                return v
+        return "📦"
+
+    def _get_vitals() -> tuple:
+        try:
+            from core.vitals import calculate_ttl
+            ttl = calculate_ttl(str(ws_path / ".auth" / "balance.json"))
+            d = json.loads((ws_path / ".auth" / "balance.json").read_text("utf-8"))
+            bal, bmr = float(d.get("balance", 0)), float(d.get("bmr", 1))
+        except Exception:
+            ttl, bal, bmr = 0.5, 0, 1
+        if ttl > 30:
+            return bal, bmr, ttl, "HEALTHY", "🟢"
+        elif ttl > 7:
+            return bal, bmr, ttl, "BALANCE", "🟡"
+        return bal, bmr, ttl, "SURVIVAL", "🔴"
+
+    def _get_backlog_counts() -> tuple:
+        try:
+            bl = (ws_path / "EVOLUTION_BACKLOG.md").read_text("utf-8")
+            active = len([l for l in bl.splitlines() if l.strip().startswith(("- [ ]", "- [RESEARCH]", "- [PROFIT]"))])
+            done = len([l for l in bl.splitlines() if "[DONE]" in l or "- [x]" in l])
+            return active, done
+        except Exception:
+            return 0, 0
+
+    def _load_skills() -> list:
+        try:
+            return json.loads((ws_path / "skills" / "skills.json").read_text("utf-8")).get("skills", [])
+        except Exception:
+            return []
+
     # ---- 命令处理器（勿用纯 content_types=text 抢 /start）----
 
     @bot.message_handler(commands=["home"])
@@ -1084,59 +1204,51 @@ def main() -> int:
         if not _is_admin(cid, admins):
             bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
             return
-        try:
-            from core.vitals import calculate_ttl
-            ttl = calculate_ttl(str(ws_path / ".auth" / "balance.json"))
-            bal_data = json.loads((ws_path / ".auth" / "balance.json").read_text("utf-8"))
-            bal = float(bal_data.get("balance", 0))
-            bmr = float(bal_data.get("bmr", 1))
-        except Exception:
-            ttl, bal, bmr = 0.5, 0, 1
-        mode = "HEALTHY" if ttl > 30 else "BALANCE" if ttl > 7 else "SURVIVAL"
-        bar_len = 15
-        filled = min(int(ttl / 60 * bar_len), bar_len)
-        hp_bar = "█" * filled + "░" * (bar_len - filled)
-
-        # Skills count
-        try:
-            sdata = json.loads((ws_path / "skills" / "skills.json").read_text("utf-8"))
-            skill_count = len(sdata.get("skills", []))
-        except Exception:
-            skill_count = 0
-
-        # Runners count
+        bal, bmr, ttl, mode, mode_e = _get_vitals()
+        skills = _load_skills()
         runners = list((ws_path / "skills").glob("*/runner.py"))
+        active, done = _get_backlog_counts()
 
-        # Backlog
-        try:
-            bl = (ws_path / "EVOLUTION_BACKLOG.md").read_text("utf-8")
-            active = len([l for l in bl.splitlines() if l.strip().startswith("- [ ]") or l.strip().startswith("- [RESEARCH]") or l.strip().startswith("- [PROFIT]")])
-            done = len([l for l in bl.splitlines() if "[DONE]" in l or "- [x]" in l])
-        except Exception:
-            active, done = 0, 0
+        bar_len = 20
+        filled = min(int(ttl / 60 * bar_len), bar_len)
+        hp = "▓" * filled + "░" * (bar_len - filled)
 
         text = (
-            "🏠 D E V C L A W   H O M E\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"♥ TTL  [{hp_bar}] {ttl:.0f}d\n"
-            f"💰 BAL  ${bal:.2f}  |  BMR ${bmr:.2f}/d\n"
-            f"⚡ MODE  {mode}\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⌂ Skills: {skill_count}  |  ⚙ Organs: {len(runners)}\n"
-            f"📋 Tasks: {active} pending / {done} done\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "   ╔══════════╗\n"
-            "   ║  ◉    ◉  ║\n"
-            "   ║    ▽    ║\n"
-            "   ║  ╰───╯  ║\n"
-            "   ╚══╦══╦══╝\n"
-            "  ╔══╝  ╚══╗\n"
-            "  ║ ≡≡≡  ≡≡≡ ║\n"
-            "  ╚════════════╝\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            '"I think, therefore I trade."'
+            "<b>🏠 D E V C L A W   H O M E</b>\n"
+            "┌──────────────────────────┐\n"
+            f"│  {mode_e} <b>MODE</b>  <code>{mode}</code>\n"
+            f"│  ♥ <b>HP</b>    <code>[{hp}]</code> <b>{ttl:.0f}d</b>\n"
+            f"│  💰 <b>BAL</b>   <code>${bal:.2f}</code>  ·  BMR <code>${bmr:.2f}/d</code>\n"
+            "├──────────────────────────┤\n"
+            f"│  🧩 <b>Skills</b> {len(skills)}    ⚙️ <b>Organs</b> {len(runners)}\n"
+            f"│  📋 <b>Tasks</b>  <code>{active}</code> pending  ·  <code>{done}</code> done\n"
+            "├──────────────────────────┤\n"
+            "│\n"
+            "│       <code>  ╔══════════╗  </code>\n"
+            "│       <code>  ║  ◉    ◉  ║  </code>\n"
+            "│       <code>  ║    ▽    ║  </code>\n"
+            "│       <code>  ║  ╰───╯  ║  </code>\n"
+            "│       <code>  ╚══╦══╦══╝  </code>\n"
+            "│       <code> ╔══╝  ╚══╗   </code>\n"
+            "│       <code> ║ ≡≡≡  ≡≡≡ ║  </code>\n"
+            "│       <code> ╚════════════╝ </code>\n"
+            "│\n"
+            '│  <i>"I think, therefore I trade."</i>\n'
+            "└──────────────────────────┘"
         )
-        bot.reply_to(message, text)
+
+        kb = types.InlineKeyboardMarkup(row_width=3)
+        kb.add(
+            types.InlineKeyboardButton("🧩 Skills", callback_data="nav:skills"),
+            types.InlineKeyboardButton("📋 Backlog", callback_data="nav:backlog"),
+            types.InlineKeyboardButton("♥ Vitals", callback_data="nav:vitals"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⚙ Status", callback_data="nav:status"),
+            types.InlineKeyboardButton("🎛 Panel", callback_data="nav:panel"),
+            types.InlineKeyboardButton("🧪 Evolve", callback_data="nav:evolve"),
+        )
+        bot.reply_to(message, text, parse_mode="HTML", reply_markup=kb)
 
     @bot.message_handler(commands=["skills"])
     def cmd_skills(message: telebot.types.Message) -> None:
@@ -1144,36 +1256,49 @@ def main() -> int:
         if not _is_admin(cid, admins):
             bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
             return
-        try:
-            sdata = json.loads((ws_path / "skills" / "skills.json").read_text("utf-8"))
-            skills = sdata.get("skills", [])
-        except Exception:
-            skills = []
+        _send_skills_panel(message.chat.id, reply_to=message.message_id)
+
+    def _send_skills_panel(chat_id: int, *, reply_to: int | None = None) -> None:
+        skills = _load_skills()
         if not skills:
-            bot.reply_to(message, "暂无已注册技能。")
+            bot.send_message(chat_id, "暂无已注册技能。")
             return
-        icons = {
-            "trading": "📈", "profit": "💰", "treasury": "🏦",
-            "compute": "⚡", "refactor": "🔧", "gene": "🧬",
-            "logic": "💊", "survival": "🛡", "sys_info": "🖥",
-            "market": "🔭", "proxy": "🌐", "meta": "🧠",
-            "evolution": "🧪", "dex": "📡", "funding": "💹",
-            "correlation": "📊", "ultimate": "🚀", "web_agent": "🕸",
-            "digital": "👷",
-        }
-        lines = ["⌂ DevClaw 技能清单\n━━━━━━━━━━━━━━━━━━━━━━━━"]
-        for s in skills:
-            icon = "📦"
-            for k, v in icons.items():
-                if k in s["id"]:
-                    icon = v
-                    break
-            lines.append(f"{icon} {s['id']}  —  {s['title']}")
-        # Runners
+
         runners = sorted(p.parent.name for p in (ws_path / "skills").glob("*/runner.py"))
-        lines.append(f"\n⚙ Active Organs ({len(runners)}):")
-        lines.append("  ".join(runners))
-        bot.reply_to(message, "\n".join(lines))
+
+        text = "<b>🧩 D E V C L A W   S K I L L S</b>\n\n"
+        for s in skills:
+            icon = _get_skill_icon(s["id"])
+            text += f"  {icon} <b>{s['id']}</b>\n"
+            text += f"      <i>{s['title']}</i>\n\n"
+
+        text += (
+            f"⚙️ <b>Active Organs</b> ({len(runners)})\n"
+            f"<code>{'  '.join(runners)}</code>\n\n"
+            "👇 <b>点击按钮一键启动技能</b>"
+        )
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        btn_pairs = []
+        for s in skills:
+            icon = _get_skill_icon(s["id"])
+            label = s["id"].replace("_", " ").title()
+            if len(label) > 18:
+                label = label[:16] + ".."
+            btn_pairs.append(
+                types.InlineKeyboardButton(
+                    f"{icon} {label}",
+                    callback_data=f"skill:{s['id'][:50]}",
+                )
+            )
+        for i in range(0, len(btn_pairs), 2):
+            kb.add(*btn_pairs[i:i+2])
+        kb.add(types.InlineKeyboardButton("🏠 返回家园", callback_data="nav:home"))
+
+        if reply_to:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb, reply_to_message_id=reply_to)
+        else:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
     @bot.message_handler(commands=["backlog"])
     def cmd_backlog(message: telebot.types.Message) -> None:
@@ -1181,30 +1306,136 @@ def main() -> int:
         if not _is_admin(cid, admins):
             bot.reply_to(message, f"无权限。chat_id={message.chat.id}")
             return
+        _send_backlog_panel(message.chat.id, reply_to=message.message_id)
+
+    def _send_backlog_panel(chat_id: int, *, reply_to: int | None = None) -> None:
         try:
             bl = (ws_path / "EVOLUTION_BACKLOG.md").read_text("utf-8")
         except Exception:
-            bot.reply_to(message, "无法读取 EVOLUTION_BACKLOG.md")
+            bot.send_message(chat_id, "无法读取 EVOLUTION_BACKLOG.md")
             return
-        active_lines = []
-        done_count = 0
+
+        active_lines, done_count = [], 0
         for line in bl.splitlines():
             s = line.strip()
-            if s.startswith("- [ ]") or s.startswith("- [RESEARCH]") or s.startswith("- [PROFIT]"):
+            if s.startswith(("- [ ]", "- [RESEARCH]", "- [PROFIT]")):
                 active_lines.append(s)
             elif "[DONE]" in s or s.startswith("- [x]"):
                 done_count += 1
-        text = "📋 Evolution Backlog\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        text = "<b>📋 E V O L U T I O N   B A C K L O G</b>\n\n"
         if active_lines:
-            text += "🔴 Active:\n"
-            for l in active_lines[:10]:
-                text += f"  {l}\n"
-            if len(active_lines) > 10:
-                text += f"  ...+{len(active_lines)-10} more\n"
+            text += "🔴 <b>Active</b>\n"
+            for i, l in enumerate(active_lines[:8], 1):
+                display = l.lstrip("- ").replace("[RESEARCH]", "🔬").replace("[PROFIT]", "💰").replace("[ ]", "⬜")
+                text += f"  {i}. {display}\n"
+            if len(active_lines) > 8:
+                text += f"\n  <i>...+{len(active_lines)-8} more</i>\n"
         else:
-            text += "✅ 无待处理任务\n"
-        text += f"\n✅ Completed: {done_count}"
-        bot.reply_to(message, text)
+            text += "✅ <b>队列清空 — 无待处理任务</b>\n"
+        text += f"\n✅ <b>Completed:</b> <code>{done_count}</code>"
+
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("🔄 刷新", callback_data="nav:backlog"),
+            types.InlineKeyboardButton("🏠 家园", callback_data="nav:home"),
+        )
+        if reply_to:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb, reply_to_message_id=reply_to)
+        else:
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+    # ---- Callback query handler — 按钮点击路由 ----
+
+    @bot.callback_query_handler(func=lambda call: True)
+    def on_callback_query(call: telebot.types.CallbackQuery) -> None:
+        cid = str(call.message.chat.id)
+        if not _is_admin(cid, admins):
+            bot.answer_callback_query(call.id, "无权限", show_alert=True)
+            return
+
+        data = call.data or ""
+        chat_id = call.message.chat.id
+
+        # Navigation
+        if data == "nav:skills":
+            bot.answer_callback_query(call.id)
+            _send_skills_panel(chat_id)
+        elif data == "nav:backlog":
+            bot.answer_callback_query(call.id)
+            _send_backlog_panel(chat_id)
+        elif data == "nav:vitals":
+            bot.answer_callback_query(call.id)
+            bal, bmr, ttl, mode, mode_e = _get_vitals()
+            bar_len = 20
+            filled = min(int(ttl / 60 * bar_len), bar_len)
+            hp = "▓" * filled + "░" * (bar_len - filled)
+            text = (
+                f"<b>♥ V I T A L S</b>\n\n"
+                f"  {mode_e} <b>Mode:</b>  <code>{mode}</code>\n"
+                f"  ♥ <b>TTL:</b>   <code>[{hp}]</code> <b>{ttl:.0f} days</b>\n"
+                f"  💰 <b>Bal:</b>   <code>${bal:.2f}</code>\n"
+                f"  🔥 <b>Burn:</b>  <code>${bmr:.2f}/day</code>\n"
+            )
+            kb = types.InlineKeyboardMarkup()
+            kb.add(
+                types.InlineKeyboardButton("🔄 刷新", callback_data="nav:vitals"),
+                types.InlineKeyboardButton("🏠 家园", callback_data="nav:home"),
+            )
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        elif data == "nav:home":
+            bot.answer_callback_query(call.id)
+            cmd_home(call.message)
+        elif data == "nav:status":
+            bot.answer_callback_query(call.id)
+            cmd_status(call.message)
+        elif data == "nav:panel":
+            bot.answer_callback_query(call.id)
+            cmd_panel(call.message)
+        elif data == "nav:evolve":
+            bot.answer_callback_query(call.id)
+            cmd_evolve(call.message)
+
+        # Skill activation — one-tap to start conversation
+        elif data.startswith("skill:"):
+            skill_id = data[6:]
+            bot.answer_callback_query(call.id, f"⚡ 启动 {skill_id}...")
+            prompt = _SKILL_PROMPTS.get(skill_id, f"运行技能 {skill_id}，给我一份简报")
+            icon = _get_skill_icon(skill_id)
+            bot.send_message(
+                chat_id,
+                f"{icon} <b>启动技能:</b> <code>{skill_id}</code>\n"
+                f"📝 <i>{prompt}</i>",
+                parse_mode="HTML",
+            )
+            _handle_text_input(chat_id, prompt, actor=f"tg:{chat_id}", channel="tg")
+
+        # Skill detail panel
+        elif data.startswith("skillinfo:"):
+            skill_id = data[10:]
+            bot.answer_callback_query(call.id)
+            skills = _load_skills()
+            skill = next((s for s in skills if s["id"] == skill_id), None)
+            if not skill:
+                bot.send_message(chat_id, "技能未找到。")
+                return
+            icon = _get_skill_icon(skill_id)
+            text = (
+                f"<b>{icon} {skill['title']}</b>\n\n"
+                f"  📌 <b>ID:</b>  <code>{skill_id}</code>\n"
+                f"  📁 <b>Path:</b> <code>{skill.get('path', 'N/A')}</code>\n"
+                f"  🔧 <b>Invoke:</b> <code>{skill.get('invoke', 'N/A')}</code>\n"
+            )
+            if skill.get("notes"):
+                text += f"\n  📝 <i>{skill['notes']}</i>\n"
+            kb = types.InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                types.InlineKeyboardButton(f"⚡ 启动", callback_data=f"skill:{skill_id}"),
+                types.InlineKeyboardButton("◀ 返回技能", callback_data="nav:skills"),
+            )
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        else:
+            bot.answer_callback_query(call.id, "未知操作")
 
     @bot.message_handler(commands=["whoami"])
     def cmd_whoami(message: telebot.types.Message) -> None:
@@ -1370,33 +1601,44 @@ def main() -> int:
                 "仍可用 /whoami 查看本消息中的 id。",
             )
             return
-        bot.reply_to(
-            message,
-            "🏠 DevClaw TG 网关\n\n"
-            "━━ 总览 ━━\n"
-            "/home — 像素家园（Skills/Organs/任务看板）\n"
-            "/skills — 列出全部已注册技能\n"
-            "/backlog — 进化任务队列\n"
-            "/vitals — TTL / 余额 / 生存状态\n\n"
-            "━━ 运维 ━━\n"
-            "/status — 队列与工作区\n"
-            "/panel — 运行控制面板\n"
-            "/pause — 暂停接任务和自主循环\n"
-            "/resume — 恢复开工\n"
-            "/sim — 锁定 simulation only\n\n"
-            "━━ 进化 ━━\n"
-            "/evolve — 失败日志 → 草稿 SKILL\n\n"
-            "━━ 工具 ━━\n"
-            "/whoami — 查看 chat_id\n"
-            "/ping — 存活检测\n\n"
-            f"工作区: {os.environ.get('DEVCLAW_WORKSPACE')}\n"
-            f"最大迭代: {max_iters}\n"
-            f"自主心跳: {'开 (TG_AUTONOMOUS_LIFE=1)' if _env_truthy('TG_AUTONOMOUS_LIFE') else '关'}\n"
-            f"空闲自检: {'开 (TG_IDLE_AUTOTICK=1)' if _env_truthy('TG_IDLE_AUTOTICK') else '关'}\n"
-            f"逻辑链: {'开 (TG_AUTONOMOUS_LOGIC_CHAIN=1)' if _env_truthy('TG_AUTONOMOUS_LOGIC_CHAIN') else '关'}\n\n"
-            '自然语言也能控：例如"开始干活，检查一下仓库""暂停""只模拟交易""控制面板"。\n\n'
-            + _control_panel_text(),
+        bal, bmr, ttl, mode, mode_e = _get_vitals()
+        skills = _load_skills()
+        text = (
+            "<b>🏠 DevClaw TG Gateway</b>\n\n"
+            f"{mode_e} <code>{mode}</code>  ·  ♥ <b>{ttl:.0f}d</b>  ·  🧩 <b>{len(skills)}</b> skills\n\n"
+
+            "┌─ <b>📊 总览</b> ─────────────┐\n"
+            "│ /home     像素家园总览\n"
+            "│ /skills    技能面板 (可点击启动)\n"
+            "│ /backlog  进化任务队列\n"
+            "│ /vitals    TTL · 余额 · 状态\n"
+            "├─ <b>⚙ 运维</b> ─────────────┤\n"
+            "│ /status    队列与工作区\n"
+            "│ /panel     运行控制面板\n"
+            "│ /pause    暂停自主循环\n"
+            "│ /resume  恢复开工\n"
+            "│ /sim        锁定 simulation\n"
+            "├─ <b>🧬 进化</b> ─────────────┤\n"
+            "│ /evolve   失败日志 → 新 SKILL\n"
+            "├─ <b>🔧 工具</b> ─────────────┤\n"
+            "│ /whoami  查看 chat_id\n"
+            "│ /ping      存活检测\n"
+            "└──────────────────────────┘\n\n"
+            "<i>也可直接发自然语言指令</i>"
         )
+
+        kb = types.InlineKeyboardMarkup(row_width=3)
+        kb.add(
+            types.InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+            types.InlineKeyboardButton("🧩 Skills", callback_data="nav:skills"),
+            types.InlineKeyboardButton("📋 Backlog", callback_data="nav:backlog"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("♥ Vitals", callback_data="nav:vitals"),
+            types.InlineKeyboardButton("⚙ Status", callback_data="nav:status"),
+            types.InlineKeyboardButton("🎛 Panel", callback_data="nav:panel"),
+        )
+        bot.reply_to(message, text, parse_mode="HTML", reply_markup=kb)
 
     @bot.message_handler(
         content_types=["text"],
