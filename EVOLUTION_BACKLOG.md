@@ -14,3 +14,4 @@
 
 ## Completed
 (empty)
+- [RESEARCH] 为 WebLLMProxy 实现多源负载均衡：当 Claude 额度耗尽时自动切换到 Groq，两者都不可用时回退到 Ollama

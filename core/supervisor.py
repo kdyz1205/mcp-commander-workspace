@@ -133,11 +133,17 @@ class DevClawSupervisor:
 
         try:
             # Use Claude CLI to actually execute the task
+            # Build prompt as a temp file to avoid shell quoting issues
+            prompt = (
+                f"修改代码完成以下需求：{task}\n\n"
+                f"直接读取相关文件、修改代码、运行测试。不要问我要做什么，直接做。"
+            )
+            # Use stdin piping to avoid shell quoting issues on Windows
             r = subprocess.run(
-                [claude_bin, "--dangerously-skip-permissions", "-p",
-                 f"你是DevClaw。在当前目录执行此任务（直接做，不要解释）：\n{task[:2000]}"],
+                [claude_bin, "--dangerously-skip-permissions", "-p", prompt],
                 capture_output=True, text=True, timeout=300,
                 cwd=ws, encoding="utf-8", errors="replace",
+                input="",  # Provide empty stdin to prevent hanging
             )
 
             if r.returncode == 0 and r.stdout.strip():

@@ -37,12 +37,61 @@
 |------|------|
 | 2026-04-02 | 初始化模板 |
 | 2026-04-03 | 清理重复推理片段（470行→40行），修复 reasoning_episode 去重+上限 |
+| 2026-04-04 | 清理 offline_brain 第 7 次追加的模板推理片段 |
 
 
-### 推理片段 [2026-04-04 03:47 UTC] — offline_brain <!-- h:2ab5ec1997a7 -->
+### 推理片段 [2026-04-04 07:16 UTC] — offline_brain <!-- h:2ad8dc8f03ac -->
 
 **假设（Hypothesis）:**
-用户请求: 你刚才发现consciousness_seed.py的意识循环在空转，IQ一直是50，Generation 0。请修复这个问题——让它真正学到东西；当前系统处于 DEGRADED，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+用户请求: 请分析以下内容：AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA；当前系统处于 DEGRADED，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---
+
+
+### 推理片段 [2026-04-04 07:21 UTC] — offline_brain <!-- h:bd80496286ca -->
+
+**假设（Hypothesis）:**
+用户请求: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA；当前系统处于 DEGRADED，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---
+
+
+### 推理片段 [2026-04-04 07:29 UTC] — offline_brain <!-- h:1ab832b7faf2 -->
+
+**假设（Hypothesis）:**
+用户请求: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA；当前系统处于 CRITICAL，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
+
+**待验证（Verify）:**
+- 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
+- 确认代理状态、Colab bundle、自愈脚本、skill synthesis 是否完整
+- 若云端模型恢复，再让 DevClaw 进入完整工具循环处理更复杂代码改造
+
+**若证伪则修正（Revise）:**
+若当前离线动作不足以完成任务，恢复 Ollama/OpenAI 后继续执行生产级修复。
+
+---
+
+
+### 推理片段 [2026-04-04 07:33 UTC] — offline_brain <!-- h:d1a0a7582b26 -->
+
+**假设（Hypothesis）:**
+用户请求: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA；当前系统处于 HEALTHY，需优先保证生存/修复/迁移闭环，再等待云端大脑恢复。
 
 **待验证（Verify）:**
 - 检查 .claw/ 下是否生成 parasite/outbox/treasury/self-test 等产物
