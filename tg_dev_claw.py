@@ -403,29 +403,34 @@ def main() -> int:
                         _dispatch_reply(channel, chat_id,
                             f"[Worker] Claude CLI 启动中… ({_claude_bin})",
                             request_id=request_id, kind="status")
-                        # Pass instruction directly — use --system-prompt for role context
-                        _sys_prompt = (
-                            "你是 DevClaw，一个自主进化 AI agent，运行在用户的本机上。"
-                            "直接执行任务并返回结果。不要总结项目历史，不要问问题，直接做。"
-                            "\n\n【你的能力 — 直接用Python调用这些模块】"
-                            "\n1. 代币分析: 读取 skills/sk_mcap_monitor/runner.py，调用 check_and_alert(token_addr, target)"
-                            "\n2. 模拟交易: from skills.sk_trade_executor.executor import TradeExecutor, TradingMode; "
+                        # Write system prompt to temp file (avoids Windows cmd-line length limits)
+                        import tempfile as _wtf
+                        _sys_prompt_text = (
+                            "你是 DevClaw，一个自主进化 AI agent，运行在用户的本机上。\n"
+                            "直接执行任务并返回结果。不要总结项目历史，不要问问题，直接做。\n\n"
+                            "【你的能力 - 直接用Python调用这些模块】\n"
+                            "1. 模拟交易: from skills.sk_trade_executor.executor import TradeExecutor, TradingMode; "
                             "executor = TradeExecutor(Path('.'), mode=TradingMode.SIMULATION); "
-                            "result = executor.execute_swap('USDC', token_addr, amount, max_slippage=0.02)"
-                            "\n3. 虚拟钱包: from core.virtual_wallet import VirtualWallet; "
-                            "wallet = VirtualWallet(Path('.')); wallet.get_all_balances()"
-                            "\n4. 生存压强: from core.metabolic_kernel import calculate_psi; "
-                            "psi = calculate_psi(Path('.'))"
-                            "\n5. 行情查询: 用 DexScreener API 或运行 skills/profit_hunter/runner.py"
-                            "\n\n【铁律】不要说'我不会交易'。你有模拟交易能力。"
-                            "用户问交易相关问题时，直接用上面的Python代码执行。"
-                            "用户问行情时，用工具查询真实数据，不要编造价格。"
+                            "result = executor.execute_swap('USDC', token_addr, amount, max_slippage=0.02)\n"
+                            "2. 虚拟钱包: from core.virtual_wallet import VirtualWallet; "
+                            "wallet = VirtualWallet(Path('.')); wallet.get_all_balances()\n"
+                            "3. 生存压强: from core.metabolic_kernel import calculate_psi; "
+                            "psi = calculate_psi(Path('.'))\n"
+                            "4. 行情查询: 用 DexScreener API 或 skills/profit_hunter/runner.py\n\n"
+                            "【铁律】不要说'我不会交易'。你有模拟交易能力。直接用Python执行。\n"
                         )
+                        _sys_file = _wtf.NamedTemporaryFile(
+                            mode="w", suffix=".txt", delete=False,
+                            encoding="utf-8", dir=str(ws_path / ".claw"),
+                        )
+                        _sys_file.write(_sys_prompt_text)
+                        _sys_file.close()
+                        _sys_file_path = _sys_file.name
                         # Use Popen so we can send heartbeats while Claude works
                         _CLAUDE_TIMEOUT = 300  # 5 min
                         _proc = _wsp.Popen(
                             [_claude_bin, "--dangerously-skip-permissions",
-                             "--system-prompt", _sys_prompt,
+                             "--append-system-prompt-file", _sys_file_path,
                              "-p", instruction[:3000]],
                             stdout=_wsp.PIPE, stderr=_wsp.STDOUT,  # merge stderr into stdout to avoid deadlock
                             text=True, cwd=str(ws_path),
@@ -542,6 +547,12 @@ def main() -> int:
                                 _proc.wait(timeout=5)
                             except Exception:
                                 pass
+                        # Clean up temp system prompt file
+                        try:
+                            if _sys_file_path:
+                                os.unlink(_sys_file_path)
+                        except Exception:
+                            pass
 
                     if not _claude_done:
                         # Fallback: full dev_claw_run tool loop
