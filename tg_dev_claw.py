@@ -341,22 +341,21 @@ def main() -> int:
 
     _register_bot_commands(bot)
 
-    # ── Conversation memory: last N exchanges per chat_id ──
-    _conv_history: dict[int, list[dict[str, str]]] = {}  # chat_id → [{role, text}]
-    _CONV_MAX = 10  # keep last 10 exchanges
+    # ── Conversation memory: persistent on disk, survives restarts ──
+    from claw_runtime.persistent_memory import save_history, load_history
+    _CONV_MAX = 20
 
     def _add_to_history(chat_id: int, role: str, text: str) -> None:
-        if chat_id not in _conv_history:
-            _conv_history[chat_id] = []
-        _conv_history[chat_id].append({"role": role, "text": text[:500]})
-        _conv_history[chat_id] = _conv_history[chat_id][-_CONV_MAX:]
+        hist = load_history(ws_path, chat_id)
+        hist.append({"role": role, "text": text[:500], "ts": __import__("time").time()})
+        save_history(ws_path, chat_id, hist, max_entries=_CONV_MAX)
 
     def _get_history_context(chat_id: int) -> str:
-        hist = _conv_history.get(chat_id, [])
+        hist = load_history(ws_path, chat_id)
         if not hist:
             return ""
         lines = []
-        for h in hist[-6:]:  # last 6 messages for context
+        for h in hist[-6:]:
             prefix = "用户" if h["role"] == "user" else "DevClaw"
             lines.append(f"{prefix}: {h['text'][:200]}")
         return "\n".join(lines)
