@@ -239,14 +239,59 @@ class DevClawSupervisor:
                     result["action_taken"] = f"not_understood: {task[:40]}"
                     result["output"] = output
                 else:
-                    result["action_taken"] = f"completed: {task[:40]}"
-                    result["output"] = output
-                    try:
-                        from core.backlog_manager import mark_task_done
-                        mark_task_done(self.backlog_path, task)
-                        logging.info(f"BACKLOG: Marked done '{task[:40]}'")
-                    except Exception:
-                        pass
+                    # ── AUTOPSY: Physical verification ──
+                    # Don't trust LLM's claim of completion.
+                    # Check disk for real changes.
+                    from core.autopsy import run_autopsy
+                    ws_path = Path(ws)
+
+                    # Extract mentioned .py files from LLM output
+                    _mentioned_files = re.findall(
+                        r'[\w/\\]+\.py', output
+                    )
+                    # Deduplicate and filter to plausible paths
+                    _expected = list(dict.fromkeys(
+                        f for f in _mentioned_files
+                        if (ws_path / f).is_file() or "/" in f or "\\" in f
+                    ))[:10]
+
+                    autopsy = run_autopsy(
+                        ws_path,
+                        expected_files=_expected if _expected else None,
+                        run_tests=True,
+                        check_git=True,
+                    )
+
+                    if autopsy.passed:
+                        result["action_taken"] = f"completed+verified: {task[:40]}"
+                        result["output"] = output
+                        result["autopsy"] = {
+                            "passed": True,
+                            "checks": f"{autopsy.checks_passed}/{autopsy.checks_run}",
+                        }
+                        logging.info(
+                            f"AUTOPSY PASS: {autopsy.checks_passed}/{autopsy.checks_run} checks"
+                        )
+                        try:
+                            from core.backlog_manager import mark_task_done
+                            mark_task_done(self.backlog_path, task)
+                            logging.info(f"BACKLOG: Marked done '{task[:40]}'")
+                        except Exception:
+                            pass
+                    else:
+                        # LLM claimed success but autopsy found problems
+                        result["action_taken"] = f"autopsy_failed: {task[:40]}"
+                        result["output"] = output
+                        result["autopsy"] = {
+                            "passed": False,
+                            "checks": f"{autopsy.checks_passed}/{autopsy.checks_run}",
+                            "failures": autopsy.failures[:5],
+                        }
+                        logging.error(
+                            f"AUTOPSY FAIL: LLM claimed completion but physical "
+                            f"verification failed — {autopsy.failures}"
+                        )
+                        # DO NOT mark task as done — it stays in backlog for retry
 
                 # Experience consolidation
                 try:

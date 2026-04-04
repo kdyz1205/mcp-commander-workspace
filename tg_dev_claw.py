@@ -515,6 +515,22 @@ def main() -> int:
                                 _wclean = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _final_text)[:4000]
                                 _dispatch_reply(channel, chat_id, _wclean,
                                     request_id=request_id, kind="progress")
+
+                            # ── AUTOPSY: verify LLM actually did what it claimed ──
+                            _autopsy_tag = ""
+                            try:
+                                from core.autopsy import run_autopsy
+                                _mentioned = _wre.findall(r'[\w/\\]+\.py', _full_text)
+                                _expect = [f for f in dict.fromkeys(_mentioned) if (ws_path / f).is_file()][:10]
+                                if _expect:
+                                    _aut = run_autopsy(ws_path, expected_files=_expect, run_tests=False, check_git=True)
+                                    if _aut.passed:
+                                        _autopsy_tag = f" [验尸✓ {_aut.checks_passed}/{_aut.checks_run}]"
+                                    else:
+                                        _autopsy_tag = f" [验尸✗ {'; '.join(_aut.failures[:2])}]"
+                            except Exception:
+                                pass
+
                             _claude_done = True
                             _task_success = True
                             _task_model = "claude-cli"
