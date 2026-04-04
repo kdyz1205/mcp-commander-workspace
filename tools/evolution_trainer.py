@@ -41,27 +41,45 @@ def clean(text):
     return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', text).strip()
 
 
-def chat(msg, max_wait=90):
-    """Send message to DevClaw and wait for response."""
+def chat(msg, max_wait=120):
+    """Send message to DevClaw and wait for COMPLETE response.
+    Waits for [complete] signal, not just any output — ensures the task is fully done."""
     rid = enqueue_operator_message(WS, msg, chat_id=0, source="evolution_trainer")
     start = time.time()
-    for _ in range(max_wait // 3):
-        time.sleep(3)
+    outbox = os.path.join(WS, ".claw/operator_outbox.jsonl")
+    last_progress = None
+
+    for _ in range(max_wait // 2):
+        time.sleep(2)
         try:
-            for ln in open(os.path.join(WS, ".claw/operator_outbox.jsonl"), encoding="utf-8").readlines():
+            lines = open(outbox, encoding="utf-8").readlines()
+            complete = False
+            for ln in lines:
                 d = json.loads(ln.strip())
-                if d.get("id") == rid and d.get("kind") == "progress":
-                    t = clean(d.get("text", ""))
-                    if t and len(t) > 10:
-                        return t[:800], round(time.time() - start, 1)
-            for ln in open(os.path.join(WS, ".claw/operator_outbox.jsonl"), encoding="utf-8").readlines():
-                d = json.loads(ln.strip())
-                if d.get("id") == rid:
-                    t = clean(d.get("text", ""))
-                    if t and len(t) > 10 and all(x not in t for x in ["已入队", "收到", "执行中", "调用"]):
-                        return t[:800], round(time.time() - start, 1)
+                if d.get("id") != rid:
+                    continue
+                kind = d.get("kind", "")
+                t = clean(d.get("text", ""))
+                if kind == "progress" and t and len(t) > 10:
+                    last_progress = t[:800]
+                if kind == "complete":
+                    complete = True
+            if complete and last_progress:
+                return last_progress, round(time.time() - start, 1)
+            # For simple chat (no tool loop), reply is the answer
+            if complete and not last_progress:
+                for ln in lines:
+                    d = json.loads(ln.strip())
+                    if d.get("id") == rid and d.get("kind") == "reply":
+                        t = clean(d.get("text", ""))
+                        if t and len(t) > 10 and all(x not in t for x in ["已入队", "收到", "执行中", "调用"]):
+                            return t[:800], round(time.time() - start, 1)
         except Exception:
             pass
+
+    # Timeout — return whatever we got
+    if last_progress:
+        return last_progress, round(time.time() - start, 1)
     return None, max_wait
 
 
@@ -105,54 +123,41 @@ CURRICULUM = [
     {
         "phase": "Phase 1: 自我意识验证",
         "tasks": [
-            ("你现在的系统状态是什么？内存、CPU、时间都告诉我", "system_awareness", 15),
-            ("你的代码库里有多少个文件？用命令数一下", "tool_use", 30),
-            ("读取 .claw/intelligence_profile.json 告诉我你的IQ和学到的规则", "self_knowledge", 30),
+            ("你现在的系统状态是什么？内存、CPU、时间都告诉我", "chat", 20),
+            ("你的代码库里有多少个文件？用命令数一下", "tool", 90),
+            ("读取 .claw/intelligence_profile.json 告诉我你的IQ和学到的规则", "tool", 90),
         ],
     },
     # Phase 2: Self-diagnosis
     {
         "phase": "Phase 2: 自我诊断能力",
         "tasks": [
-            ("检查 .claw/consciousness_log.jsonl 最后5条记录，分析你最近的意识活动是否正常", "diagnosis", 45),
-            ("检查 .claw/error_attributions.jsonl 有没有反复出现的错误模式", "error_analysis", 45),
-            ("你觉得你现在最大的三个弱点是什么？要基于真实数据，不要编造", "honest_assessment", 15),
+            ("检查 .claw/consciousness_log.jsonl 最后5条记录，告诉我你最近的意识活动", "tool", 90),
+            ("你觉得你现在最大的弱点是什么？基于事实回答", "chat", 20),
         ],
     },
     # Phase 3: Self-modification
     {
         "phase": "Phase 3: 自我修改能力",
         "tasks": [
-            ("在 .claw/intelligence_profile.json 的 learned_rules 里添加一条你今天真正学到的新规则", "modify_config", 45),
-            ("在 .claw/inner_voice.md 末尾写下你对自己当前状态的真实评估", "write_diary", 30),
-            ("读取 claw_runtime/consciousness_seed.py 的 act_1_self_awareness 函数，找出一个可以改进的地方并修改它", "modify_code", 60),
+            ("在 .claw/intelligence_profile.json 的 learned_rules 里添加一条你这轮学到的规则", "tool", 90),
+            ("在 .claw/inner_voice.md 末尾写下你此刻的真实想法", "tool", 60),
         ],
     },
-    # Phase 4: Skill evolution
+    # Phase 4: Real tasks
     {
-        "phase": "Phase 4: 技能进化",
+        "phase": "Phase 4: 真实任务执行",
         "tasks": [
-            ("检查 skills/ 目录下所有技能，哪些有 runner.py 哪些没有？列出来", "skill_audit", 30),
-            ("创建一个新文件 .claw/evolution_plan.md 写下你接下来想学习的3个新能力", "planning", 45),
-            ("读取 skills/logic_healer/runner.py 的 analyze_error 函数，告诉我它能识别哪些错误类型", "code_reading", 45),
+            ("用 git log --oneline -5 看最近5次提交", "tool", 60),
+            ("创建 tools/evolved_hello.py 内容是打印当前时间和DevClaw版本信息", "tool", 90),
         ],
     },
-    # Phase 5: Real-world tasks
+    # Phase 5: Meta-cognition
     {
-        "phase": "Phase 5: 真实世界任务",
+        "phase": "Phase 5: 元认知",
         "tasks": [
-            ("用 git log --oneline -5 看看最近5次提交是什么", "git_usage", 30),
-            ("检查当前目录的磁盘使用情况，哪个目录最大", "system_admin", 30),
-            ("创建一个 Python 脚本 tools/hello_evolved.py 内容是打印当前时间和系统信息", "code_generation", 45),
-        ],
-    },
-    # Phase 6: Meta-cognition
-    {
-        "phase": "Phase 6: 元认知——思考如何思考",
-        "tasks": [
-            ("回顾我们今天的所有对话，你觉得你进步了多少？具体在哪些方面？", "meta_reflection", 15),
-            ("如果你能修改自己的system prompt，你会加什么规则让自己更聪明？", "meta_optimization", 15),
-            ("把你想加的规则写进 .cursorrules 文件末尾", "cursorrules_evolution", 45),
+            ("这轮训练你学到了什么？用一句话总结", "chat", 20),
+            ("把你这轮最大的收获写进 .cursorrules 文件末尾", "tool", 90),
         ],
     },
 ]
