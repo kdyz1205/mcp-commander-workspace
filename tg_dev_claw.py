@@ -320,8 +320,24 @@ def main() -> int:
     task_q: queue.Queue[tuple[str, int, str, str | None]] = queue.Queue()
     max_iters = int(os.environ.get("TG_DEVCLAW_MAX_ITERS", str(_DEFAULT_ITERS)))
     system_append = os.environ.get("TG_DEVCLAW_SYSTEM_APPEND", "").strip() or None
-    worker_busy = threading.Event()
-    run_lock = threading.Lock()
+
+    # ── Multi-worker concurrency ──
+    _WORKER_COUNT = int(os.environ.get("TG_DEVCLAW_WORKERS", "3"))
+    _active_workers = 0
+    _active_lock = threading.Lock()
+    run_semaphore = threading.Semaphore(_WORKER_COUNT)
+
+    class _WorkerBusyProxy:
+        """Drop-in for old worker_busy Event.
+        is_set() → True when ALL workers are busy (no spare capacity)."""
+        def is_set(self) -> bool:
+            with _active_lock:
+                return _active_workers >= _WORKER_COUNT
+        def active_count(self) -> int:
+            with _active_lock:
+                return _active_workers
+
+    worker_busy = _WorkerBusyProxy()
 
     _register_bot_commands(bot)
 
@@ -362,8 +378,9 @@ def main() -> int:
                     )
                     pause_notice_sent = True
                 time.sleep(2)
-            with run_lock:
-                worker_busy.set()
+            with run_semaphore:
+                with _active_lock:
+                    _active_workers += 1
                 merged = _merged_system_append(instruction) or system_append
                 _task_t0 = time.time()
                 _task_success = False
@@ -450,10 +467,12 @@ def main() -> int:
                     except Exception:
                         pass
                     _configure_telegram_http_runtime()
-                    worker_busy.clear()
+                    with _active_lock:
+                        _active_workers -= 1
                     task_q.task_done()
 
-    threading.Thread(target=worker, daemon=True, name="devclaw-worker").start()
+    for _wi in range(_WORKER_COUNT):
+        threading.Thread(target=worker, daemon=True, name=f"devclaw-worker-{_wi}").start()
 
     def _broadcast_admins(text: str) -> None:
         for aid in admins:
@@ -648,15 +667,42 @@ def main() -> int:
                 "改进", "improve", "优化", "optimize", "进化", "evolve",
                 "自己", "self", "学习", "learn",
             ))
-            # Queue ALL medium tasks for worker — worker uses Claude CLI brain
+            # Queue for worker — worker uses Claude CLI brain
+            # Also add to backlog if it's a significant task
+            if len(text) > 30:
+                try:
+                    _backlog_path = ws_path / "EVOLUTION_BACKLOG.md"
+                    if _backlog_path.is_file():
+                        _bl = _backlog_path.read_text(encoding="utf-8")
+                        if f"- [ ] {text[:80]}" not in _bl:
+                            _bl = _bl.replace(
+                                "## Active Tasks\n",
+                                f"## Active Tasks\n- [ ] {text[:200]}\n",
+                            )
+                            _backlog_path.write_text(_bl, encoding="utf-8")
+                except Exception:
+                    pass
             _dispatch_reply(channel, chat_id, "收到，执行中…", request_id=request_id)
             task_q.put((channel, chat_id, text, request_id))
             return
 
-        # TIER 3: Grand tasks → decompose + full tool loop
+        # TIER 3: Grand tasks → write to EVOLUTION_BACKLOG + Claude CLI execution
         if assessment and assessment.should_decompose:
+            # This is a grand vision — add to the physical backlog for the Autonomous Engineer
+            try:
+                _backlog_path = ws_path / "EVOLUTION_BACKLOG.md"
+                if _backlog_path.is_file():
+                    _bl = _backlog_path.read_text(encoding="utf-8")
+                    if f"- [ ] {text[:100]}" not in _bl:
+                        _bl = _bl.replace(
+                            "## Active Tasks\n",
+                            f"## Active Tasks\n- [ ] {text[:200]}\n",
+                        )
+                        _backlog_path.write_text(_bl, encoding="utf-8")
+            except Exception:
+                pass
             _dispatch_reply(channel, chat_id,
-                f"🧠 宏大任务 (复杂度 {assessment.score}/10)，自动拆解执行中…",
+                f"🧠 宏大任务 (复杂度 {assessment.score}/10)，已写入进化待办清单，自动执行中…",
                 request_id=request_id)
         else:
             _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
