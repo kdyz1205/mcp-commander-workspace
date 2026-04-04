@@ -558,6 +558,9 @@ def main() -> int:
             "学习", "learn", "进化", "evolve", "优化", "optimize",
             "价格", "price", "行情", "市场", "btc", "eth", "bitcoin",
             "查询", "query", "多少钱", "涨", "跌", "k线",
+            "回测", "backtest", "策略", "strategy", "因子", "factor",
+            "神经网络", "neural", "深度学习", "deep learning",
+            "做", "开始", "继续", "执行吧", "去做",
         )
         _is_task = any(kw in text.lower() for kw in _task_keywords)
         _is_short = len(text) < 150
@@ -642,6 +645,14 @@ def main() -> int:
         # ── THREE-TIER ROUTING ──
         if _is_short and not _is_task:
             # TIER 1: Simple chat → Ollama (2-5s), fallback Claude CLI
+            # BUT: if very short AND has conversation history, use Claude CLI
+            # (short follow-ups like "做" "按照常规的" need context from history)
+            if len(text) < 20 and _hist_ctx and len(_hist_ctx) > 50:
+                answer = _ask_claude(text, 45)
+                if answer:
+                    _add_to_history(chat_id, "assistant", answer[:500])
+                    _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
+                    return
             answer = _ask_ollama(text)
             # If Ollama says "I don't know" or "need to check", escalate to Claude CLI
             _cant_answer = answer and any(x in answer for x in (
