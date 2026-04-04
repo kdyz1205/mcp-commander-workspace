@@ -828,14 +828,16 @@ def main() -> int:
 
         def _ask_claude(prompt, timeout=60):
             """High-quality brain via Claude CLI (user subscription, FREE).
-            Uses -p flag for full tool access + injects conversation history."""
+            Uses -p flag for full tool access + injects fresh conversation history."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
+                # Re-fetch history at call time (not stale closure from routing)
+                _fresh_hist = _get_history_context(chat_id)
                 _full_prompt = (
-                    "你是DevClaw。用户通过Telegram发来消息。直接执行或回答，不要总结项目历史。\n\n"
+                    "你是DevClaw。用户通过Telegram发来消息。直接回答用户的问题，不要说'等你的指令'。\n\n"
                 )
-                if _hist_ctx:
-                    _full_prompt += f"[最近对话记录]\n{_hist_ctx}\n\n"
+                if _fresh_hist:
+                    _full_prompt += f"[最近对话记录]\n{_fresh_hist}\n\n"
                 _full_prompt += f"[用户消息]\n{prompt[:2300]}"
                 _r = _sp.run(
                     [_claude_path, "--dangerously-skip-permissions", "-p", _full_prompt],
@@ -876,33 +878,35 @@ def main() -> int:
         )
 
         if _is_short and not _is_task and not _ollama_blacklist:
-            # TIER 1: Simple chat → Ollama (2-5s), fallback Claude CLI
-            # BUT: if message has rich conversation history, use Claude CLI
-            # (follow-ups like "你觉得他怎么样" need context from prior analysis)
-            if _hist_ctx and len(_hist_ctx) > 50:
+            # TIER 1: Simple chat
+            # Short messages (<10 chars) or messages with history context → Claude CLI
+            # (Ollama can't handle follow-ups or ultra-short messages meaningfully)
+            _use_claude_direct = (
+                len(text) < 10
+                or (_hist_ctx and len(_hist_ctx) > 30)
+            )
+            if _use_claude_direct:
                 answer = _ask_claude(text, 45)
                 if answer:
                     _add_to_history(chat_id, "assistant", answer[:500])
                     _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                     return
+            # Longer standalone questions → try Ollama first, fallback Claude CLI
             answer = _ask_ollama(text)
-            # Hallucination guard: Ollama can't do real actions (monitor, trade, code).
-            # If it CLAIMS it will do something actionable, that's a hallucination.
-            _cant_answer = answer and any(x in answer for x in (
+            # Hallucination guard: Ollama can't do real actions.
+            _is_bad_answer = not answer or (answer and any(x in answer for x in (
                 "不知道", "不确定", "需要查", "无法获取", "没有能力", "不能联网",
                 "需要通过", "无法回答", "没有信息", "无法确定", "抱歉",
                 "超出", "不了解", "没法", "做不到",
                 "can't", "don't know", "unable to", "not sure", "sorry",
-            ))
-            _fake_action = answer and any(x in answer for x in (
                 "我会监控", "我会执行", "我会帮你", "我来帮你",
                 "已经开始", "正在执行", "正在监控", "正在分析",
                 "I'll monitor", "I will execute", "I'm now",
                 "等你的指令", "等你的消息", "等待指令", "等待你的",
                 "已就位", "准备就绪", "准备好了", "随时待命",
-                "收到，我是", "发消息过来", "发消息吧",
-            ))
-            if _cant_answer or _fake_action or not answer:
+                "收到，我是", "发消息过来", "发消息吧", "等你的指令",
+            )))
+            if _is_bad_answer:
                 _claude_answer = _ask_claude(text, 45)
                 if _claude_answer:
                     answer = _claude_answer
