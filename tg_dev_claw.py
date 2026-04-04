@@ -643,6 +643,24 @@ def main() -> int:
             return None
 
         # ── THREE-TIER ROUTING ──
+        # Price/real-time data queries → skip Ollama, go straight to Claude CLI
+        _needs_realtime = any(kw in text.lower() for kw in (
+            "价格", "price", "多少钱", "市价", "现价", "实时",
+            "行情", "涨了", "跌了", "几刀", "美金",
+            "market price", "how much", "current price",
+            "币价", "汇率", "报价", "盘面", "走势",
+            "btc价", "eth价", "sol价", "bnb价",
+        ))
+
+        # ── TIER 0: Price/real-time queries → Claude CLI directly (Ollama can't fetch live data) ──
+        if _needs_realtime:
+            answer = _ask_claude(text, 60)
+            if answer:
+                _add_to_history(chat_id, "assistant", answer[:500])
+                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
+                return
+            # If Claude CLI also fails, fall through to worker queue
+
         if _is_short and not _is_task:
             # TIER 1: Simple chat → Ollama (2-5s), fallback Claude CLI
             # BUT: if very short AND has conversation history, use Claude CLI
@@ -654,10 +672,12 @@ def main() -> int:
                     _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                     return
             answer = _ask_ollama(text)
-            # If Ollama says "I don't know" or "need to check", escalate to Claude CLI
+            # If Ollama says "I don't know" or can't answer, auto-escalate to Claude CLI
             _cant_answer = answer and any(x in answer for x in (
                 "不知道", "不确定", "需要查", "无法获取", "没有能力", "不能联网",
-                "需要通过", "can't", "don't know",
+                "需要通过", "无法回答", "没有信息", "无法确定", "抱歉",
+                "超出", "不了解", "没法", "做不到",
+                "can't", "don't know", "unable to", "not sure", "sorry",
             ))
             if _cant_answer or not answer:
                 _claude_answer = _ask_claude(text, 45)

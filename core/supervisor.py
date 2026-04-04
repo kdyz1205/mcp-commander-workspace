@@ -66,11 +66,18 @@ class DevClawSupervisor:
             )
 
     def get_next_backlog_task(self) -> str | None:
-        """Read first unchecked task from backlog."""
+        """Read first unchecked task from backlog (supports both [ ] and [TYPE] formats)."""
+        import re
         try:
             for line in Path(self.backlog_path).read_text(encoding="utf-8").splitlines():
-                if line.strip().startswith("- [ ]"):
-                    return line.strip()[6:].strip()
+                s = line.strip()
+                # Match: - [ ] task  OR  - [RESEARCH] task  OR  - [PROFIT] task
+                # Skip: - [x] task  OR  - [DONE] task
+                if s.startswith("- [ ]"):
+                    return s[6:].strip()
+                m = re.match(r"^- \[(RESEARCH|PROFIT)\]\s+(.*)", s)
+                if m:
+                    return m.group(2).strip()
         except OSError:
             pass
         return None

@@ -224,6 +224,7 @@ def reflect_on_outcomes(outcomes: list[ActionOutcome]) -> dict[str, Any]:
         "delegation_stats": delegation_stats,
         "overall_success_rate": sum(1 for o in outcomes if o.success) / max(len(outcomes), 1),
         "total_actions": len(outcomes),
+        "_new_successes": sum(1 for o in outcomes if o.success),
     }
 
 
@@ -239,20 +240,51 @@ def adapt_profile(
     """
     Update the intelligence profile based on reflections.
     This is how DevClaw gets smarter over time.
+
+    Only increments generation when genuinely new knowledge is acquired
+    (new insights, changed tool proficiency, or new delegation data).
     """
-    # Update tool proficiency
+    actually_learned = False
+
+    # Update tool proficiency — only count meaningful changes (not float noise)
     for tool, stats in reflection.get("tool_stats", {}).items():
-        profile.tool_proficiency[tool] = round(stats.get("success_rate", 0.5), 3)
+        new_rate = round(stats.get("success_rate", 0.5), 2)
+        old_rate = profile.tool_proficiency.get(tool)
+        if old_rate is None:
+            profile.tool_proficiency[tool] = new_rate
+            actually_learned = True
+        elif abs(new_rate - old_rate) >= 0.05:
+            # Require >= 5% change to count as real learning, not float drift
+            profile.tool_proficiency[tool] = new_rate
+            actually_learned = True
 
     # Update delegation preferences
     for brain, stats in reflection.get("delegation_stats", {}).items():
-        profile.delegation_preference[brain] = round(stats.get("success_rate", 0.5), 3)
+        new_rate = round(stats.get("success_rate", 0.5), 2)
+        old_rate = profile.delegation_preference.get(brain)
+        if old_rate is None:
+            profile.delegation_preference[brain] = new_rate
+            actually_learned = True
+        elif abs(new_rate - old_rate) >= 0.05:
+            profile.delegation_preference[brain] = new_rate
+            actually_learned = True
 
-    # Update learned rules from insights
+    # Update learned rules from insights — robust dedup against near-duplicates
+    def _normalize_insight(s: str) -> str:
+        """Strip numbers and whitespace to detect semantically identical insights."""
+        import re
+        return re.sub(r'[\d.%/()]+', '', s).strip().lower()
+
+    existing_normalized = {_normalize_insight(r) for r in profile.learned_rules}
+    new_rules_added = 0
     for insight in reflection.get("insights", []):
-        # Avoid duplicates
-        if not any(insight[:50] in existing for existing in profile.learned_rules):
+        norm = _normalize_insight(insight)
+        if norm not in existing_normalized and len(norm) > 10:
             profile.learned_rules.append(insight)
+            existing_normalized.add(norm)
+            new_rules_added += 1
+    if new_rules_added > 0:
+        actually_learned = True
     # Keep only the 20 most recent/relevant rules
     profile.learned_rules = profile.learned_rules[-20:]
 
@@ -270,13 +302,19 @@ def adapt_profile(
     overall_rate = reflection.get("overall_success_rate", 0.5)
     profile.overall_iq = round(50 + (overall_rate - 0.5) * 100, 1)
 
-    # Update counters
-    profile.total_actions += reflection.get("total_actions", 0)
-    profile.total_successes += int(
-        reflection.get("total_actions", 0) * reflection.get("overall_success_rate", 0.5)
-    )
+    # Update counters — use the actions actually analyzed this cycle
+    # (run_intelligence_cycle already filters to only new-since-last-reflection)
+    new_actions = reflection.get("total_actions", 0)
+    new_successes = reflection.get("_new_successes")
+    if new_successes is None:
+        new_successes = int(new_actions * reflection.get("overall_success_rate", 0.5))
+    profile.total_actions += new_actions
+    profile.total_successes += new_successes
     profile.last_reflection = time.time()
-    profile.generation += 1
+
+    # Only increment generation when we actually learned something new
+    if actually_learned:
+        profile.generation += 1
 
     save_intelligence_profile(workspace, profile)
     return profile
@@ -341,6 +379,9 @@ def run_intelligence_cycle(
     OBSERVE → REFLECT → ADAPT → EVOLVE
 
     Call this daily (e.g., in REM sleep) or after every N tasks.
+
+    Skips evolution when no new outcomes exist since last reflection
+    to prevent idle generation inflation.
     """
     ws = Path(workspace).resolve()
 
@@ -349,16 +390,36 @@ def run_intelligence_cycle(
     if not outcomes:
         return {"status": "no_data", "message": "No recent outcomes to learn from"}
 
+    # Skip if no new outcomes since last reflection
+    profile = load_intelligence_profile(ws)
+    latest_outcome_ts = max(o.timestamp for o in outcomes)
+    if profile.last_reflection > 0 and latest_outcome_ts <= profile.last_reflection:
+        return {
+            "status": "no_new_data",
+            "message": "No new outcomes since last reflection — skipping to avoid idle spin",
+            "generation": profile.generation,
+            "overall_iq": profile.overall_iq,
+        }
+
+    # Only analyze outcomes newer than last reflection (avoid re-processing)
+    if profile.last_reflection > 0:
+        new_outcomes = [o for o in outcomes if o.timestamp > profile.last_reflection]
+        # If we have new outcomes, reflect on them; otherwise use all for first run
+        if new_outcomes:
+            outcomes = new_outcomes
+
     # REFLECT
     reflection = reflect_on_outcomes(outcomes)
 
-    # ADAPT
-    profile = load_intelligence_profile(ws)
+    # ADAPT (only increments generation if genuinely new knowledge is gained)
+    gen_before = profile.generation
     profile = adapt_profile(ws, reflection, profile)
+    actually_evolved = profile.generation > gen_before
 
     # Report
+    status = "evolved" if actually_evolved else "unchanged"
     summary = {
-        "status": "evolved",
+        "status": status,
         "generation": profile.generation,
         "overall_iq": profile.overall_iq,
         "actions_analyzed": len(outcomes),
@@ -369,9 +430,15 @@ def run_intelligence_cycle(
     }
 
     if callable(emit):
-        emit(
-            f"[🧬 自进化] Generation {profile.generation} | IQ: {profile.overall_iq} | "
-            f"分析了 {len(outcomes)} 个行动 | 学到 {len(reflection.get('insights', []))} 条新规则"
-        )
+        if actually_evolved:
+            emit(
+                f"[🧬 自进化] Generation {profile.generation} | IQ: {profile.overall_iq} | "
+                f"分析了 {len(outcomes)} 个行动 | 学到新规则"
+            )
+        else:
+            emit(
+                f"[🧬 自检] Generation {profile.generation} | IQ: {profile.overall_iq} | "
+                f"分析了 {len(outcomes)} 个行动 | 无新知识"
+            )
 
     return summary

@@ -88,9 +88,14 @@ def _harvest_outcomes_from_logs(ws: Path) -> int:
     """
     from claw_runtime.self_intelligence import ActionOutcome, record_action, load_recent_outcomes
 
-    # Don't re-harvest if we already have recent outcomes
+    # Don't re-harvest if we already have recent outcomes from real tasks
     existing = load_recent_outcomes(ws, hours=24)
-    if len(existing) >= 5:
+    real_outcomes = [o for o in existing if o.action_type not in ("survival_tick", "survival_action", "consciousness_tick")]
+    if len(existing) >= 5 and len(real_outcomes) >= 2:
+        return 0
+    # Also skip if we harvested recently (within last hour) to avoid flooding
+    harvested_ts = [o.timestamp for o in existing if o.action_type in ("survival_tick", "survival_action")]
+    if harvested_ts and time.time() - max(harvested_ts) < 3600:
         return 0
 
     already_seen_ts = {o.timestamp for o in existing}
@@ -427,7 +432,13 @@ def act_4_execute_improvement(ws: Path, plans: list[dict[str, str]]) -> list[str
                     if harvested > 0:
                         result = run_intelligence_cycle(ws)
                 if result.get("status") == "evolved":
-                    actions_taken.append(f"Self-intelligence cycle: generation {result.get('generation')}, IQ {result.get('overall_iq')}")
+                    actions_taken.append(
+                        f"Self-intelligence cycle: generation {result.get('generation')}, "
+                        f"IQ {result.get('overall_iq')}, "
+                        f"new insights: {result.get('insights_gained', 0)}"
+                    )
+                # "no_new_data" / "unchanged" / "no_data" → no action recorded
+                # This prevents generation inflation from routine survival ticks
             except Exception:
                 pass
 
@@ -459,15 +470,9 @@ def act_4_execute_improvement(ws: Path, plans: list[dict[str, str]]) -> list[str
             except Exception:
                 pass
 
-    # Increment generation counter on every improvement execution
-    if actions_taken:
-        profile_path = _claw(ws) / "intelligence_profile.json"
-        try:
-            profile = json.loads(profile_path.read_text(encoding="utf-8")) if profile_path.is_file() else {}
-            profile["generation"] = profile.get("generation", 0) + 1
-            profile_path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    # NOTE: Generation is now incremented inside adapt_profile() ONLY when
+    # genuinely new knowledge is learned. No separate increment here to
+    # prevent idle generation inflation (double-counting fix).
 
     _log_thought(ws, "improvement_actions", json.dumps(actions_taken, ensure_ascii=False))
     return actions_taken
