@@ -344,6 +344,10 @@ def main() -> int:
             with run_lock:
                 worker_busy.set()
                 merged = _merged_system_append(instruction) or system_append
+                _task_t0 = time.time()
+                _task_success = False
+                _task_error = ""
+                _task_model = ""
                 try:
                     # ── Worker brain: Claude CLI first (fast, powerful, free) ──
                     # Then fall back to dev_claw_run tool loop if Claude CLI unavailable
@@ -366,6 +370,8 @@ def main() -> int:
                             _wclean = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _wr.stdout).strip()
                             _dispatch_reply(channel, chat_id, _wclean[:4000], request_id=request_id, kind="progress")
                             _claude_done = True
+                            _task_success = True
+                            _task_model = "claude-cli"
                     except (_wsp.TimeoutExpired, FileNotFoundError, Exception):
                         pass
 
@@ -386,6 +392,8 @@ def main() -> int:
                             system_append=merged,
                             progress_hook=hook,
                         )
+                        _task_success = True
+                        _task_model = "dev_claw_run"
                     if channel == "local":
                         _dispatch_reply(
                             channel,
@@ -395,6 +403,7 @@ def main() -> int:
                             kind="complete",
                         )
                 except Exception as e:  # noqa: BLE001
+                    _task_error = f"{e!s}"[:500]
                     try:
                         append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
                     except Exception:
@@ -402,6 +411,23 @@ def main() -> int:
                     err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
                     _dispatch_reply(channel, chat_id, err, request_id=request_id, kind="error")
                 finally:
+                    # ── Record action outcome for self-intelligence learning ──
+                    try:
+                        from claw_runtime.self_intelligence import ActionOutcome, record_action
+                        record_action(ws_path, ActionOutcome(
+                            timestamp=_task_t0,
+                            action_type="task_execution",
+                            tool_name=_task_model or "unknown",
+                            instruction_summary=instruction[:200],
+                            success=_task_success,
+                            tokens_used=len(instruction) // 4,
+                            time_sec=time.time() - _task_t0,
+                            error=_task_error,
+                            quality_score=0.8 if _task_success else 0.1,
+                            model_used=_task_model,
+                        ))
+                    except Exception:
+                        pass
                     _configure_telegram_http_runtime()
                     worker_busy.clear()
                     task_q.task_done()

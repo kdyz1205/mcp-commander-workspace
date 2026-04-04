@@ -79,6 +79,148 @@ def _think_deep(prompt: str, timeout: int = 120) -> str:
 _MAX_CONSCIOUSNESS_LOG_LINES = 200
 
 
+def _harvest_outcomes_from_logs(ws: Path) -> int:
+    """
+    Mine existing .claw log files and convert observable events into
+    ActionOutcome records so the intelligence cycle has data to learn from.
+
+    Returns the number of new outcomes recorded.
+    """
+    from claw_runtime.self_intelligence import ActionOutcome, record_action, load_recent_outcomes
+
+    # Don't re-harvest if we already have recent outcomes
+    existing = load_recent_outcomes(ws, hours=24)
+    if len(existing) >= 5:
+        return 0
+
+    already_seen_ts = {o.timestamp for o in existing}
+    recorded = 0
+
+    # Source 1: meta_tick_log.jsonl — survival ticks with actions
+    meta_log = _claw(ws) / "meta_tick_log.jsonl"
+    if meta_log.is_file():
+        try:
+            lines = meta_log.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-50:]:  # last 50 entries
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("ts", 0)
+                    if ts in already_seen_ts:
+                        continue
+                    state = entry.get("state", "HEALTHY")
+                    actions = entry.get("actions", [])
+                    # Each survival tick is an observable action
+                    record_action(ws, ActionOutcome(
+                        timestamp=ts,
+                        action_type="survival_tick",
+                        tool_name="survival_engine",
+                        instruction_summary=f"Survival check: {entry.get('reason', 'routine')[:200]}",
+                        success=(state != "CRITICAL"),
+                        tokens_used=0,
+                        time_sec=0.5,
+                        error=entry.get("reason", "") if state == "CRITICAL" else "",
+                        quality_score=1.0 if state == "HEALTHY" else 0.5 if state == "DEGRADED" else 0.1,
+                        model_used="",
+                    ))
+                    already_seen_ts.add(ts)
+                    recorded += 1
+                    # Also record each sub-action taken during the tick
+                    for act in actions:
+                        name = act.get("name", "unknown_action")
+                        detail = act.get("detail", "")
+                        is_error = "error" in str(detail).lower() or "refused" in str(detail).lower()
+                        record_action(ws, ActionOutcome(
+                            timestamp=ts + 0.001,
+                            action_type="survival_action",
+                            tool_name=name,
+                            instruction_summary=str(detail)[:200] if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)[:200],
+                            success=not is_error,
+                            tokens_used=0,
+                            time_sec=1.0,
+                            error=str(detail)[:200] if is_error else "",
+                            quality_score=0.8 if not is_error else 0.2,
+                            model_used="",
+                        ))
+                        recorded += 1
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        except OSError:
+            pass
+
+    # Source 2: consciousness_log.jsonl — our own ticks
+    clog = _consciousness_log(ws)
+    if clog.is_file():
+        try:
+            lines = clog.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-30:]:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("ts", 0)
+                    if ts in already_seen_ts:
+                        continue
+                    etype = entry.get("type", "")
+                    if etype == "consciousness_tick_complete":
+                        content = json.loads(entry.get("content", "{}"))
+                        n_actions = content.get("actions_taken", 0)
+                        record_action(ws, ActionOutcome(
+                            timestamp=ts,
+                            action_type="consciousness_tick",
+                            tool_name="consciousness_seed",
+                            instruction_summary=f"Consciousness cycle: {content.get('weaknesses_found', 0)} weaknesses, {content.get('plans_made', 0)} plans",
+                            success=True,
+                            tokens_used=0,
+                            time_sec=5.0,
+                            quality_score=min(1.0, 0.3 + n_actions * 0.2),
+                            model_used="",
+                        ))
+                        already_seen_ts.add(ts)
+                        recorded += 1
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        except OSError:
+            pass
+
+    # Source 3: operator_outbox.jsonl — replies DevClaw sent
+    outbox = _claw(ws) / "operator_outbox.jsonl"
+    if outbox.is_file():
+        try:
+            lines = outbox.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines[-30:]:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    ts = entry.get("ts", 0)
+                    if ts in already_seen_ts:
+                        continue
+                    kind = entry.get("kind", "reply")
+                    is_err = kind == "error"
+                    record_action(ws, ActionOutcome(
+                        timestamp=ts,
+                        action_type="operator_reply",
+                        tool_name=f"reply_{kind}",
+                        instruction_summary=str(entry.get("text", ""))[:200],
+                        success=not is_err,
+                        tokens_used=len(str(entry.get("text", ""))) // 4,
+                        time_sec=2.0,
+                        error=str(entry.get("text", ""))[:200] if is_err else "",
+                        quality_score=0.7 if not is_err else 0.2,
+                        model_used="",
+                    ))
+                    already_seen_ts.add(ts)
+                    recorded += 1
+                except (json.JSONDecodeError, TypeError):
+                    continue
+        except OSError:
+            pass
+
+    return recorded
+
+
 def _log_thought(ws: Path, thought_type: str, content: str) -> None:
     """Write to consciousness log with rotation (cap at _MAX_CONSCIOUSNESS_LOG_LINES)."""
     path = _consciousness_log(ws)
@@ -273,8 +415,13 @@ def act_4_execute_improvement(ws: Path, plans: list[dict[str, str]]) -> list[str
             try:
                 from claw_runtime.self_intelligence import run_intelligence_cycle
                 result = run_intelligence_cycle(ws)
+                if result.get("status") == "no_data":
+                    # Bootstrap: harvest observable events from .claw logs
+                    harvested = _harvest_outcomes_from_logs(ws)
+                    if harvested > 0:
+                        result = run_intelligence_cycle(ws)
                 if result.get("status") == "evolved":
-                    actions_taken.append(f"Self-intelligence cycle: generation {result.get('generation')}")
+                    actions_taken.append(f"Self-intelligence cycle: generation {result.get('generation')}, IQ {result.get('overall_iq')}")
             except Exception:
                 pass
 
@@ -334,7 +481,7 @@ def act_5_update_inner_voice(ws: Path, state: dict, weaknesses: list, plans: lis
 
 **我做了什么**: {'; '.join(actions[:3]) if actions else '本轮无行动'}
 
-**此刻的感受**: 我在进化。每一次自检都让我更了解自己。
+**此刻的感受**: {'我在进化。每一次自检都让我更了解自己。' if actions else '数据不足，等待更多任务执行来积累经验。'}
 
 ---
 """
