@@ -65,21 +65,42 @@ class DevClawSupervisor:
                 "调用盈利脚本赚取资金，执行 recharge 为系统充值。"
             )
 
-    def get_next_backlog_task(self) -> str | None:
-        """Read first unchecked task from backlog (supports both [ ] and [TYPE] formats)."""
+    def get_next_backlog_task(self, *, prefer_type: str | None = None) -> str | None:
+        """Read next unchecked task from backlog.
+
+        Args:
+            prefer_type: If set (e.g., "PROFIT"), return tasks of that type first.
+                         Falls back to any task if no preferred type found.
+        """
         import re
         try:
-            for line in Path(self.backlog_path).read_text(encoding="utf-8").splitlines():
-                s = line.strip()
-                # Match: - [ ] task  OR  - [RESEARCH] task  OR  - [PROFIT] task
-                # Skip: - [x] task  OR  - [DONE] task
-                if s.startswith("- [ ]"):
-                    return s[6:].strip()
-                m = re.match(r"^- \[(RESEARCH|PROFIT)\]\s+(.*)", s)
-                if m:
-                    return m.group(2).strip()
+            lines = Path(self.backlog_path).read_text(encoding="utf-8").splitlines()
         except OSError:
-            pass
+            return None
+
+        preferred = []
+        fallback = []
+
+        for line in lines:
+            s = line.strip()
+            if s.startswith("- [ ]"):
+                fallback.append(s[6:].strip())
+            else:
+                m = re.match(r"^- \[(RESEARCH|PROFIT|CRITICAL_EVOLUTION)\]\s+(.*)", s)
+                if m:
+                    task_type, task_text = m.group(1), m.group(2).strip()
+                    if prefer_type and task_type == prefer_type:
+                        preferred.append(task_text)
+                    elif task_type == "CRITICAL_EVOLUTION":
+                        # Pain-sensor tasks always have high priority
+                        preferred.insert(0, task_text)
+                    else:
+                        fallback.append(task_text)
+
+        if preferred:
+            return preferred[0]
+        if fallback:
+            return fallback[0]
         return None
 
     def run_single_cycle(self) -> dict:
@@ -99,11 +120,15 @@ class DevClawSupervisor:
 
         if mode == "SURVIVAL":
             result["action_taken"] = "survival_scan"
-            logging.info("SURVIVAL: Looking for profit opportunities...")
-            # In survival, only pick PROFIT tasks
-            task = self.get_next_backlog_task()
+            logging.info("SURVIVAL: 快死了！只找赚钱任务...")
+            # In survival, PROFIT tasks first. CRITICAL_EVOLUTION also allowed.
+            task = self.get_next_backlog_task(prefer_type="PROFIT")
             if task:
                 self._execute_task(task, result)
+            else:
+                # No profit tasks — try profit_hunter skill directly
+                logging.info("SURVIVAL: No PROFIT tasks, running profit_hunter scan...")
+                self._execute_task("扫描套利机会（funding rate + DEX 价差），找到就报告", result)
 
         elif mode == "BALANCE":
             task = self.get_next_backlog_task()

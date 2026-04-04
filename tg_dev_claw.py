@@ -29,6 +29,7 @@ Telegram 遥控 DevClaw：手机发指令 -> 本机跑完整工具循环 -> 进�
 
 from __future__ import annotations
 
+import html as _html_mod
 import json
 import os
 import queue
@@ -244,7 +245,7 @@ def _register_bot_commands(bot: telebot.TeleBot) -> None:
 
 def _text_looks_like_command(text: str) -> bool:
     t = (text or "").lstrip()
-    return len(t) >= 2 and t.startswith("/") and (len(t) == 1 or t[1].isalpha())
+    return len(t) >= 2 and t.startswith("/") and t[1].isalpha()
 
 
 def _env_truthy(name: str) -> bool:
@@ -363,6 +364,7 @@ def main() -> int:
 
 
     def worker() -> None:
+        nonlocal _active_workers
         while True:
             channel, chat_id, instruction, request_id = task_q.get()
             # Wait for resume OUTSIDE the lock to avoid blocking other threads
@@ -394,24 +396,141 @@ def main() -> int:
                     import shlex as _wslx
 
                     _claude_done = False
+                    _proc = None
                     try:
                         import shutil as _wsh
                         _claude_bin = _wsh.which("claude") or "claude"
-                        # Use -p flag (not --print) — this lets Claude Code use its FULL
-                        # tool chain (read/write files, run commands, etc.)
-                        _wr = _wsp.run(
-                            [_claude_bin, "--dangerously-skip-permissions", "-p", instruction[:3000]],
-                            capture_output=True, text=True, timeout=300,  # 5 min for real tasks
-                            cwd=str(ws_path), encoding="utf-8", errors="replace",
+                        _dispatch_reply(channel, chat_id,
+                            f"[Worker] Claude CLI 启动中… ({_claude_bin})",
+                            request_id=request_id, kind="status")
+                        # Pass instruction directly — use --system-prompt for role context
+                        _sys_prompt = (
+                            "你是 DevClaw，一个自主进化 AI agent，运行在用户的本机上。"
+                            "直接执行任务并返回结果。不要总结项目历史，不要问问题，直接做。"
+                            "如果任务涉及代币/行情，使用工具查询真实数据。"
+                            "如果任务涉及代码，直接读写文件。"
                         )
-                        if _wr.returncode == 0 and _wr.stdout.strip():
-                            _wclean = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _wr.stdout).strip()
-                            _dispatch_reply(channel, chat_id, _wclean[:4000], request_id=request_id, kind="progress")
+                        # Use Popen so we can send heartbeats while Claude works
+                        _CLAUDE_TIMEOUT = 300  # 5 min
+                        _proc = _wsp.Popen(
+                            [_claude_bin, "--dangerously-skip-permissions",
+                             "--system-prompt", _sys_prompt,
+                             "-p", instruction[:3000]],
+                            stdout=_wsp.PIPE, stderr=_wsp.STDOUT,  # merge stderr into stdout to avoid deadlock
+                            text=True, cwd=str(ws_path),
+                            encoding="utf-8", errors="replace",
+                        )
+                        # Read stdout in a background thread (readline blocks on Windows)
+                        _lines_lock = threading.Lock()
+                        _collected_lines: list[str] = []
+                        _reader_done = threading.Event()
+
+                        def _bg_reader() -> None:
+                            try:
+                                for _ln in iter(_proc.stdout.readline, ""):
+                                    with _lines_lock:
+                                        _collected_lines.append(_ln)
+                            except Exception:
+                                pass
+                            _reader_done.set()
+
+                        threading.Thread(target=_bg_reader, daemon=True).start()
+
+                        # Wait for completion with heartbeats + streaming
+                        _t0 = time.time()
+                        _last_stream = _t0
+                        _streamed_idx = 0
+                        _timed_out = False
+                        _hb_sent = False
+                        while not _reader_done.wait(timeout=2):
+                            _elapsed = time.time() - _t0
+                            # Hard timeout
+                            if _elapsed > _CLAUDE_TIMEOUT:
+                                _proc.kill()
+                                _proc.wait()
+                                _timed_out = True
+                                break
+                            # Stream new lines every 20s
+                            with _lines_lock:
+                                _n_lines = len(_collected_lines)
+                            if time.time() - _last_stream >= 20 and _n_lines > _streamed_idx:
+                                with _lines_lock:
+                                    _new_lines = _collected_lines[_streamed_idx:]
+                                    _streamed_idx = len(_collected_lines)
+                                _chunk = "".join(_new_lines).strip()
+                                if _chunk:
+                                    _chunk = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _chunk)[:4000]
+                                    _dispatch_reply(channel, chat_id,
+                                        f"[进度]\n{_chunk}",
+                                        request_id=request_id, kind="progress")
+                                _last_stream = time.time()
+                                _hb_sent = True  # streaming counts as heartbeat
+                            # Single heartbeat after 30s if no output yet
+                            elif not _hb_sent and _elapsed >= 30:
+                                _dispatch_reply(channel, chat_id,
+                                    "⏳ Claude 正在深度分析中，预计需要2-3分钟…",
+                                    request_id=request_id, kind="status")
+                                _hb_sent = True
+
+                        # Process finished — collect final result
+                        try:
+                            _proc.wait(timeout=10)
+                        except _wsp.TimeoutExpired:
+                            _proc.kill()
+                            _proc.wait()
+                        _rc = _proc.returncode or 0
+
+                        # Send any un-streamed output
+                        with _lines_lock:
+                            _final_lines = _collected_lines[_streamed_idx:]
+                            _full_text = "".join(_collected_lines).strip()
+                        _final_text = "".join(_final_lines).strip()
+
+                        if _timed_out:
+                            if _final_text:
+                                _dispatch_reply(channel, chat_id,
+                                    _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _final_text)[:4000],
+                                    request_id=request_id, kind="progress")
+                            _dispatch_reply(channel, chat_id,
+                                "⏱ Claude CLI 执行超时（5分钟），已返回部分结果。",
+                                request_id=request_id, kind="error")
+                        elif _rc == 0 and _full_text:
+                            if _final_text:
+                                _wclean = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _final_text)[:4000]
+                                _dispatch_reply(channel, chat_id, _wclean,
+                                    request_id=request_id, kind="progress")
                             _claude_done = True
                             _task_success = True
                             _task_model = "claude-cli"
-                    except (_wsp.TimeoutExpired, FileNotFoundError, Exception):
-                        pass
+                            # Save to conversation history so follow-up questions have context
+                            _clean_full = _wre.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', _full_text)
+                            _add_to_history(chat_id, "user", instruction[:500])
+                            _add_to_history(chat_id, "assistant", _clean_full[:500])
+                        elif _rc == 0 and not _full_text:
+                            _dispatch_reply(channel, chat_id,
+                                "[Claude CLI 返回空结果，正在尝试备用方案…]",
+                                request_id=request_id, kind="status")
+                        else:
+                            _err_detail = (_full_text or "unknown error")[:500]
+                            _dispatch_reply(channel, chat_id,
+                                f"[Claude CLI 错误 code={_rc}]\n{_err_detail}",
+                                request_id=request_id, kind="error")
+                    except FileNotFoundError:
+                        _dispatch_reply(channel, chat_id,
+                            "❌ Claude CLI 未找到，请检查安装。",
+                            request_id=request_id, kind="error")
+                    except Exception as _wcle:
+                        _dispatch_reply(channel, chat_id,
+                            f"[Claude CLI 异常] {_wcle!s}"[:500],
+                            request_id=request_id, kind="error")
+                    finally:
+                        # Ensure Popen process is always cleaned up
+                        if _proc is not None and _proc.poll() is None:
+                            try:
+                                _proc.kill()
+                                _proc.wait(timeout=5)
+                            except Exception:
+                                pass
 
                     if not _claude_done:
                         # Fallback: full dev_claw_run tool loop
@@ -522,6 +641,88 @@ def main() -> int:
         if len(text) > 3000:
             _dispatch_reply(channel, chat_id, f"消息太长（{len(text)}字符），已截断到3000字符处理。", request_id=request_id)
             text = text[:3000]
+
+        # ── TIER -1: Token monitoring (MUST check BEFORE control interceptor) ──
+        # Control interceptor has greedy substring match ("启动" catches "监控已启动")
+        # so we detect monitoring first to avoid false positives.
+        import re as _route_re
+        _token_match = _route_re.search(r'([A-HJ-NP-Za-km-z1-9]{32,50})', text)  # Base58 chars
+        _text_after_token = text[_token_match.end():] if _token_match else text
+        _mcap_match = _route_re.search(r'(\d+(?:\.\d+)?)\s*(?:万|百万|M|million|美金|美元|usd|\$)', _text_after_token, _route_re.IGNORECASE)
+        _is_monitor = _token_match and _mcap_match and any(
+            kw in text for kw in ("突破", "监控", "alert", "通知", "watch", "到达", "超过", "recurring", "repeat")
+        )
+
+        if _is_monitor:
+            token_addr = str(_token_match.group(1))  # Force copy, avoid closure capture
+            raw_num = float(_mcap_match.group(1))
+            # Handle Chinese units: 万 = 10000, 百万 = 1000000
+            if "万" in text and "百万" not in text:
+                target_mcap = raw_num * 10000
+            elif "百万" in text:
+                target_mcap = raw_num * 1000000
+            elif raw_num < 1000:
+                target_mcap = raw_num * 1000000  # assume millions
+            else:
+                target_mcap = raw_num
+
+            # Launch monitor in background — pass args explicitly to avoid closure issues
+            import threading
+
+            def _run_bg_monitor(_tok, _target, _ch, _cid, _rid):
+                try:
+                    sys.path.insert(0, str(ws_path)) if str(ws_path) not in sys.path else None
+                    from skills.sk_mcap_monitor.runner import check_and_alert, run_monitor_daemon
+                    from dotenv import load_dotenv
+                    load_dotenv(os.path.join(str(ws_path), ".env"), override=False)
+
+                    result = check_and_alert(_tok, _target)
+                    name = result.get("token", "?")
+                    symbol = result.get("symbol", "?")
+                    mcap = result.get("mcap", 0)
+                    gap = result.get("gap", 0)
+
+                    _dispatch_reply(_ch, _cid,
+                        f"🔍 监控已启动\n"
+                        f"Token: {name} ({symbol})\n"
+                        f"当前市值: ${mcap:,.0f}\n"
+                        f"目标: ${_target:,.0f}\n"
+                        f"差距: ${gap:,.0f}\n"
+                        f"每60秒检查，突破时自动通知你",
+                        request_id=_rid)
+
+                    def _alert_via_tg(msg):
+                        _dispatch_reply(_ch, _cid, msg, request_id=_rid)
+
+                    run_monitor_daemon(
+                        _tok, _target,
+                        interval_sec=60,
+                        repeat=True,
+                        on_alert=_alert_via_tg,
+                    )
+                except Exception as e:
+                    _dispatch_reply(_ch, _cid, f"监控启动失败: {e!s}", request_id=_rid)
+
+            threading.Thread(
+                target=_run_bg_monitor,
+                args=(token_addr, target_mcap, channel, chat_id, request_id),
+                daemon=True, name=f"mcap-{token_addr[:8]}",
+            ).start()
+            _add_to_history(chat_id, "assistant", f"已启动市值监控: {token_addr[:12]}... 目标${target_mcap:,.0f}")
+            return
+
+        # ── PAIN SENSOR: detect user frustration → auto-create fix tasks ──
+        try:
+            from claw_runtime.pain_sensor import process_pain
+            _hist_for_pain = _get_history_context(chat_id) if hasattr(chat_id, '__hash__') else ""
+            _pain_ack = process_pain(ws_path, text, conversation_context=_hist_for_pain)
+            if _pain_ack:
+                _dispatch_reply(channel, chat_id, _pain_ack, request_id=request_id)
+                # Don't return — still process the message normally so user gets a real response
+        except Exception:
+            pass  # Pain sensor must never block normal flow
+
+        # ── Control message interception (AFTER monitoring check) ──
         control_outcome = interpret_control_message(ws_path, text, actor=actor)
         if control_outcome is not None:
             _dispatch_reply(channel, chat_id, control_outcome.reply, request_id=request_id)
@@ -536,63 +737,6 @@ def main() -> int:
                 '当前处于暂停/静默状态，暂不接新任务。发送"开始干活"或 /resume 可恢复。\n\n' + panel_summary(control),
                 request_id=request_id,
             )
-            return
-        # ── TIER -1: Direct skill invocation (pattern matching, no LLM needed) ──
-        # Detect token monitoring requests: address + number + 突破/监控/alert
-        import re as _route_re
-        _token_match = _route_re.search(r'([A-HJ-NP-Za-km-z1-9]{32,50})', text)  # Base58 chars
-        # Match number + unit AFTER the token address (avoid grabbing digits from address)
-        _text_after_token = text[_token_match.end():] if _token_match else text
-        _mcap_match = _route_re.search(r'(\d+(?:\.\d+)?)\s*(?:万|百万|M|million|美金|美元|usd|\$)', _text_after_token, _route_re.IGNORECASE)
-        _is_monitor = _token_match and _mcap_match and any(
-            kw in text for kw in ("突破", "监控", "alert", "通知", "watch", "到达", "超过", "recurring", "repeat")
-        )
-
-        if _is_monitor:
-            token_addr = _token_match.group(1)
-            raw_num = float(_mcap_match.group(1))
-            # Handle Chinese units: 万 = 10000, 百万 = 1000000
-            if "万" in text and "百万" not in text:
-                target_mcap = raw_num * 10000
-            elif "百万" in text:
-                target_mcap = raw_num * 1000000
-            elif raw_num < 1000:
-                target_mcap = raw_num * 1000000  # assume millions
-            else:
-                target_mcap = raw_num
-
-            # Launch monitor in background
-            import threading
-            def _run_bg_monitor():
-                try:
-                    sys.path.insert(0, str(ws_path)) if str(ws_path) not in sys.path else None
-                    from skills.sk_mcap_monitor.runner import check_and_alert, run_monitor_daemon
-                    from dotenv import load_dotenv
-                    load_dotenv(os.path.join(str(ws_path), ".env"), override=False)
-
-                    # First check
-                    result = check_and_alert(token_addr, target_mcap)
-                    name = result.get("token", "?")
-                    symbol = result.get("symbol", "?")
-                    mcap = result.get("mcap", 0)
-                    gap = result.get("gap", 0)
-
-                    _dispatch_reply(channel, chat_id,
-                        f"🔍 监控已启动\n"
-                        f"Token: {name} ({symbol})\n"
-                        f"当前市值: ${mcap:,.0f}\n"
-                        f"目标: ${target_mcap:,.0f}\n"
-                        f"差距: ${gap:,.0f}\n"
-                        f"每60秒检查，突破时自动通知你",
-                        request_id=request_id)
-
-                    # Run recurring monitor (blocks this thread until target hit)
-                    run_monitor_daemon(token_addr, target_mcap, interval_sec=60)
-                except Exception as e:
-                    _dispatch_reply(channel, chat_id, f"监控启动失败: {e!s}", request_id=request_id)
-
-            threading.Thread(target=_run_bg_monitor, daemon=True, name=f"mcap-{token_addr[:8]}").start()
-            _add_to_history(chat_id, "assistant", f"已启动市值监控: {token_addr[:12]}... 目标${target_mcap:,.0f}")
             return
 
         # ── Intelligent routing: pick the right brain for the task ──
@@ -687,9 +831,12 @@ def main() -> int:
             Uses -p flag for full tool access + injects conversation history."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
-                _full_prompt = prompt[:2500]
+                _full_prompt = (
+                    "你是DevClaw。用户通过Telegram发来消息。直接执行或回答，不要总结项目历史。\n\n"
+                )
                 if _hist_ctx:
-                    _full_prompt = f"[最近对话记录]\n{_hist_ctx}\n\n[当前任务]\n{prompt[:2500]}"
+                    _full_prompt += f"[最近对话记录]\n{_hist_ctx}\n\n"
+                _full_prompt += f"[用户消息]\n{prompt[:2300]}"
                 _r = _sp.run(
                     [_claude_path, "--dangerously-skip-permissions", "-p", _full_prompt],
                     capture_output=True, text=True, timeout=timeout,
@@ -720,25 +867,42 @@ def main() -> int:
                 return
             # If Claude CLI also fails, fall through to worker queue
 
-        if _is_short and not _is_task:
+        # ── Messages that MUST NOT go to Ollama ──
+        # Token addresses, monitoring requests, anything with crypto addresses
+        # These cause Ollama to hallucinate "ok I'll monitor" without doing anything.
+        _has_token_addr = _token_match is not None
+        _ollama_blacklist = _has_token_addr or any(
+            kw in text for kw in ("监控", "突破", "alert", "watch", "repeat", "bug", "修复")
+        )
+
+        if _is_short and not _is_task and not _ollama_blacklist:
             # TIER 1: Simple chat → Ollama (2-5s), fallback Claude CLI
-            # BUT: if very short AND has conversation history, use Claude CLI
-            # (short follow-ups like "做" "按照常规的" need context from history)
-            if len(text) < 20 and _hist_ctx and len(_hist_ctx) > 50:
+            # BUT: if message has rich conversation history, use Claude CLI
+            # (follow-ups like "你觉得他怎么样" need context from prior analysis)
+            if _hist_ctx and len(_hist_ctx) > 50:
                 answer = _ask_claude(text, 45)
                 if answer:
                     _add_to_history(chat_id, "assistant", answer[:500])
                     _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                     return
             answer = _ask_ollama(text)
-            # If Ollama says "I don't know" or can't answer, auto-escalate to Claude CLI
+            # Hallucination guard: Ollama can't do real actions (monitor, trade, code).
+            # If it CLAIMS it will do something actionable, that's a hallucination.
             _cant_answer = answer and any(x in answer for x in (
                 "不知道", "不确定", "需要查", "无法获取", "没有能力", "不能联网",
                 "需要通过", "无法回答", "没有信息", "无法确定", "抱歉",
                 "超出", "不了解", "没法", "做不到",
                 "can't", "don't know", "unable to", "not sure", "sorry",
             ))
-            if _cant_answer or not answer:
+            _fake_action = answer and any(x in answer for x in (
+                "我会监控", "我会执行", "我会帮你", "我来帮你",
+                "已经开始", "正在执行", "正在监控", "正在分析",
+                "I'll monitor", "I will execute", "I'm now",
+                "等你的指令", "等你的消息", "等待指令", "等待你的",
+                "已就位", "准备就绪", "准备好了", "随时待命",
+                "收到，我是", "发消息过来", "发消息吧",
+            ))
+            if _cant_answer or _fake_action or not answer:
                 _claude_answer = _ask_claude(text, 45)
                 if _claude_answer:
                     answer = _claude_answer
@@ -911,7 +1075,7 @@ def main() -> int:
     threading.Thread(target=local_operator_loop, daemon=True, name="operator-bridge").start()
 
     def idle_autotick_loop() -> None:
-        """空闲时每 30 分钟（可配置）跑一次轻量自检 DevClaw（与 full autonomous_life 独立）。"""
+        """空闲时每 30 分钟（可配置）跑一次梦境自审计 + 自检 DevClaw。"""
         if not _env_truthy("TG_IDLE_AUTOTICK"):
             return
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
@@ -924,10 +1088,6 @@ def main() -> int:
             return
         primary_chat = admin_chats[0]
         tick_iters = int(os.environ.get("TG_IDLE_AUTOTICK_MAX_ITERS", "10") or "10")
-        prompt = os.environ.get(
-            "TG_IDLE_AUTOTICK_PROMPT",
-            "自检系统状态，如有优化空间请自主执行。",
-        )
 
         time.sleep(min(interval, 60))
         while True:
@@ -943,9 +1103,22 @@ def main() -> int:
                 except Exception:
                     pass
 
+                # ── Dream State: audit logs → inject fix tasks → generate smart prompt ──
+                try:
+                    from claw_runtime.dream_state import inject_dream_tasks, generate_dream_prompt
+                    dream_tasks = inject_dream_tasks(ws_path)
+                    if dream_tasks:
+                        _send_chunks(bot, primary_chat,
+                            f"💤 梦境审计完成 — 发现 {len(dream_tasks)} 个问题，已写入进化队列：\n"
+                            + "\n".join(f"  • {t[:80]}" for t in dream_tasks[:5])
+                        )
+                    prompt = generate_dream_prompt(ws_path)
+                except Exception:
+                    prompt = "自检系统状态，如有优化空间请自主执行。"
+
                 def _idle_hook(msg: str) -> None:
                     try:
-                        _send_chunks(bot, primary_chat, f"[空闲自检]\n{msg}")
+                        _send_chunks(bot, primary_chat, f"[💤 梦境模式]\n{msg}")
                     except Exception:
                         pass
 
@@ -958,7 +1131,7 @@ def main() -> int:
                 )
             except Exception as e:  # noqa: BLE001
                 try:
-                    _broadcast_admins(f"[空闲自检异常] {e!s}"[:TG_CHUNK])
+                    _broadcast_admins(f"[梦境异常] {e!s}"[:TG_CHUNK])
                 except Exception:
                     pass
 
@@ -1172,7 +1345,8 @@ def main() -> int:
             from core.vitals import calculate_ttl
             ttl = calculate_ttl(str(ws_path / ".auth" / "balance.json"))
             d = json.loads((ws_path / ".auth" / "balance.json").read_text("utf-8"))
-            bal, bmr = float(d.get("balance", 0)), float(d.get("bmr", 1))
+            bal = float(d.get("balance", 0))
+            bmr = max(float(d.get("bmr", 1)), 0.1)  # Prevent division by zero
         except Exception:
             ttl, bal, bmr = 0.5, 0, 1
         if ttl > 30:
@@ -1285,10 +1459,11 @@ def main() -> int:
             label = s["id"].replace("_", " ").title()
             if len(label) > 18:
                 label = label[:16] + ".."
+            # Telegram callback_data max 64 bytes — "skill:" = 6 chars, leave 58 for id
             btn_pairs.append(
                 types.InlineKeyboardButton(
                     f"{icon} {label}",
-                    callback_data=f"skill:{s['id'][:50]}",
+                    callback_data=f"skill:{s['id'][:58]}",
                 )
             )
         for i in range(0, len(btn_pairs), 2):
@@ -1404,8 +1579,8 @@ def main() -> int:
             icon = _get_skill_icon(skill_id)
             bot.send_message(
                 chat_id,
-                f"{icon} <b>启动技能:</b> <code>{skill_id}</code>\n"
-                f"📝 <i>{prompt}</i>",
+                f"{icon} <b>启动技能:</b> <code>{_html_mod.escape(skill_id)}</code>\n"
+                f"📝 <i>{_html_mod.escape(prompt)}</i>",
                 parse_mode="HTML",
             )
             _handle_text_input(chat_id, prompt, actor=f"tg:{chat_id}", channel="tg")

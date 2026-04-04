@@ -20,6 +20,8 @@ def calculate_ttl(balance_path: str = ".auth/balance.json") -> float:
     try:
         data = json.loads(Path(balance_path).read_text(encoding="utf-8"))
         balance = float(data.get("balance", 0))
+        if balance <= 0:
+            return 0.0  # Dead — no balance left
         bmr = float(data.get("bmr", 1.0))
         if bmr <= 0:
             bmr = 0.1  # prevent division by zero

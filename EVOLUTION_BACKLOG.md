@@ -1,6 +1,7 @@
 # DevClaw Evolution Backlog
 
 ## Active Tasks
+- [ ] EkDGB5fbPXiRmDDjxKcC7dFjzvFZj2KT9t7oeyyPx4SX 再分析一下这个
 - [PROFIT] 代币市值监控：接受Solana代币合约地址+市值阈值，定期查询DexScreener，突破时TG通知用户（recurring监控）
 - [x] 新任务：实现 LOB 做市策略核心引擎。完整规格见 docs/lob_market_making_spec.md。核心要求：1) NumPy/Polars 向量化实现 25 因子（OFI、WAP、Imbalance、Depth Entropy、Micro-price）2) 交叉盘硬过滤 3) SHAP 权重反推 4) MC Dropout 确信度校验。→ skills/sk_lob_engine/ (28/28 tests passed)
 - [DONE] [RESEARCH] 实现 LOB 做市策略核心引擎：基于 docs/lob_market_making_spec.md 规格，用 NumPy/Polars 实现 25 因子毫秒级计算（OFI、WAP、Imbalance、Depth Entropy、Micro-price），含 SHAP 权重反推 + MC Dropout 确信度校验

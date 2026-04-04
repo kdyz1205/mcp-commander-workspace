@@ -333,7 +333,26 @@ def allows_autonomous_life(state: RuntimeControlState) -> bool:
 
 
 def _contains_any(text: str, phrases: tuple[str, ...]) -> bool:
-    return any(phrase in text for phrase in phrases)
+    """Check if text contains any control phrase.
+
+    For short messages (<60 chars), use simple substring matching.
+    For longer messages, require the phrase to appear as a meaningful
+    portion — not buried inside unrelated content like '监控已启动'.
+    """
+    text_len = len(text)
+    for phrase in phrases:
+        if phrase not in text:
+            continue
+        # Short messages: any match counts (e.g., "启动" alone)
+        if text_len < 60:
+            return True
+        # Long messages: phrase must be >=20% of the text
+        # OR appear at the very start (first 30 chars)
+        if len(phrase) / text_len >= 0.2:
+            return True
+        if text[:30].find(phrase) >= 0:
+            return True
+    return False
 
 
 def _strip_control_phrases(text: str) -> str:

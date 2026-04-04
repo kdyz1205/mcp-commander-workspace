@@ -235,6 +235,20 @@ class SurvivalEngine:
         if not q["openai_key_configured"]:
             reasons.append("OPENAI_API_KEY missing")
 
+        # ── TTL check: if balance is running out, DevClaw must feel the pain ──
+        ttl = None
+        ttl_critical = _env_float("SURVIVAL_TTL_CRITICAL_DAYS", 3.0)
+        ttl_degraded = _env_float("SURVIVAL_TTL_DEGRADED_DAYS", 7.0)
+        try:
+            from core.vitals import calculate_ttl
+            ttl = calculate_ttl(str(self.workspace / ".auth" / "balance.json"))
+            if ttl <= ttl_critical:
+                reasons.append(f"TTL {ttl:.1f}d <= {ttl_critical}d — 快死了，必须赚钱")
+            elif ttl <= ttl_degraded:
+                reasons.append(f"TTL {ttl:.1f}d <= {ttl_degraded}d — 余额告急")
+        except Exception:
+            pass
+
         is_critical = (
             q["insufficient_quota_events_24h"] > 0
             or q["soft_budget_exhausted"]
@@ -242,6 +256,7 @@ class SurvivalEngine:
             or (dg is not None and dg < disk_crit_gb)
             or (mp is not None and mp >= mem_thr_crit)
             or q["rate_like_events_1h"] >= r429_crit
+            or (ttl is not None and ttl <= ttl_critical)
         )
         if is_critical:
             return SurvivalState.CRITICAL, "; ".join(reasons) or "critical"
@@ -250,6 +265,7 @@ class SurvivalEngine:
             (dg is not None and dg < disk_deg_gb)
             or (mp is not None and mp >= mem_thr_deg)
             or q["rate_like_events_1h"] >= r429_deg
+            or (ttl is not None and ttl <= ttl_degraded)
         )
         if is_degraded:
             return SurvivalState.DEGRADED, "; ".join(reasons) or "degraded"

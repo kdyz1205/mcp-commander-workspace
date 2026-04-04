@@ -47,7 +47,8 @@ def send_tg_alert(message: str) -> bool:
     try:
         import telebot
         token = os.environ.get("TG_BOT_TOKEN", "").strip()
-        chat_id = os.environ.get("TG_ADMIN_CHAT_IDS", "").strip().split(",")[0]
+        raw_ids = os.environ.get("TG_ADMIN_CHAT_IDS", "").strip()
+        chat_id = raw_ids.split(",")[0].strip() if raw_ids else ""
         if token and chat_id:
             bot = telebot.TeleBot(token)
             bot.send_message(int(chat_id), message)
@@ -109,27 +110,81 @@ def run_monitor_daemon(
     target_mcap: float,
     interval_sec: int = 60,
     max_checks: int = 0,  # 0 = infinite
+    repeat: bool = True,
+    on_alert: Any = None,
+    stop_event: Any = None,  # threading.Event to signal shutdown
 ):
-    """Run recurring monitor. Checks every interval_sec until target hit."""
-    print(f"[MONITOR] Watching {token_address[:12]}... Target: ${target_mcap:,.0f}")
+    """Run recurring monitor. Checks every interval_sec.
+
+    Args:
+        repeat: If True, keep monitoring after breach (notify every time).
+                If False, stop after first breach.
+        on_alert: Optional callback(message_str) for sending alerts.
+                  Falls back to send_tg_alert() if not provided.
+    """
+    print(f"[MONITOR] Watching {token_address[:12]}... Target: ${target_mcap:,.0f} (repeat={repeat})")
     checks = 0
+    last_breach_notified = 0.0  # Debounce: don't spam if mcap hovers around target
+    DEBOUNCE_SEC = 300  # 5 min cooldown between repeat alerts
+
     while True:
         checks += 1
-        result = check_and_alert(token_address, target_mcap)
+        try:
+            result = check_and_alert(token_address, target_mcap)
+        except Exception as e:
+            print(f"[MONITOR] Fetch error: {e}")
+            time.sleep(interval_sec)
+            continue
+
         mcap = result.get("mcap", 0)
-        print(f"[{result.get('timestamp', '?')}] {result.get('symbol', '?')}: ${mcap:,.0f} / ${target_mcap:,.0f}", end="")
+        symbol = result.get("symbol", "?")
+        name = result.get("token", "?")
+        ts = result.get("timestamp", "?")
 
         if result.get("breached"):
-            print(" 🎯 BREACHED!")
-            return result
+            now = time.time()
+            if now - last_breach_notified >= DEBOUNCE_SEC:
+                msg = (
+                    f"🚨 市值突破!\n"
+                    f"Token: {name} ({symbol})\n"
+                    f"市值: ${mcap:,.0f}\n"
+                    f"目标: ${target_mcap:,.0f}\n"
+                    f"价格: ${result.get('price', 0)}\n"
+                    f"时间: {ts}"
+                )
+                if on_alert:
+                    try:
+                        on_alert(msg)
+                    except Exception:
+                        send_tg_alert(msg)
+                else:
+                    send_tg_alert(msg)
+                last_breach_notified = now
+                print(f"[{ts}] {symbol}: ${mcap:,.0f} 🎯 BREACHED! Alert sent.")
+            else:
+                print(f"[{ts}] {symbol}: ${mcap:,.0f} 🎯 (debounce, skip alert)")
+
+            if not repeat:
+                return result
         else:
-            print(f" (gap: ${result.get('gap', 0):,.0f})")
+            print(f"[{ts}] {symbol}: ${mcap:,.0f} / ${target_mcap:,.0f} (gap: ${result.get('gap', 0):,.0f})")
 
         if max_checks > 0 and checks >= max_checks:
             print(f"[MONITOR] Max checks ({max_checks}) reached. Stopping.")
             return result
 
-        time.sleep(interval_sec)
+        # Support graceful shutdown
+        if stop_event and stop_event.is_set():
+            print(f"[MONITOR] Shutdown signal received. Stopping.")
+            return result
+
+        # Use event.wait() for interruptible sleep if available
+        if stop_event:
+            stop_event.wait(timeout=interval_sec)
+            if stop_event.is_set():
+                return result
+        else:
+            time.sleep(interval_sec)
 
 
 def execute(**kwargs):
