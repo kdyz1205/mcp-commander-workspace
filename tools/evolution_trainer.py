@@ -209,6 +209,19 @@ def main():
         # End of round summary
         status(f"ROUND {round_num} COMPLETE: {total_pass}/{total_tasks} total pass rate")
 
+        # Send round summary to TG so user can track without the PowerShell window
+        try:
+            p = json.loads(open(os.path.join(WS, ".claw/intelligence_profile.json"), encoding="utf-8").read())
+            tg_summary = (
+                f"🧬 Evolution Round {round_num} Complete\n"
+                f"Pass: {total_pass}/{total_tasks}\n"
+                f"IQ: {p.get('overall_iq', '?')} | Gen: {p.get('generation', '?')} | "
+                f"Rules: {len(p.get('learned_rules', []))}"
+            )
+            send_to_tg(tg_summary)
+        except Exception:
+            pass
+
         # Check evolution progress
         try:
             p = json.loads(open(os.path.join(WS, ".claw/intelligence_profile.json"), encoding="utf-8").read())
@@ -223,7 +236,42 @@ def main():
         time.sleep(10)
 
 
+def send_to_tg(text):
+    """Send training progress to TG so user can watch there instead."""
+    try:
+        import telebot
+        token = os.environ.get("TG_BOT_TOKEN", "").strip()
+        chat_id = os.environ.get("TG_ADMIN_CHAT_IDS", "").strip().split(",")[0]
+        if token and chat_id:
+            bot = telebot.TeleBot(token)
+            # Truncate for TG
+            for i in range(0, min(len(text), 4000), 4000):
+                bot.send_message(int(chat_id), text[i:i+4000])
+    except Exception:
+        pass
+
+
+# Also log to file
+_LOG_FILE = os.path.join(WS, ".claw", "evolution_training.log")
+
+
+def log_and_print(text):
+    """Print to console AND log to file."""
+    print(text)
+    try:
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%H:%M:%S] ") + re.sub(r'\033\[[0-9;]*m', '', text) + "\n")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    # Redirect stdin to prevent user input from crashing the process
+    try:
+        sys.stdin = open(os.devnull, "r")
+    except Exception:
+        pass
+
     try:
         main()
     except KeyboardInterrupt:
