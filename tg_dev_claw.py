@@ -917,6 +917,9 @@ def main() -> int:
             "跑各种", "模拟买", "模拟卖", "模拟交易", "paper trade",
             "run strategy", "run scan", "backtest", "start trading",
             "profit hunt", "funding rate", "资金费率",
+            "修复bug", "修复", "fix bug", "自我修复", "自愈",
+            "钱包状态", "持仓", "portfolio", "余额",
+            "生存状态", "vitals", "psi", "压强",
         ))
         if _hardwire_kw:
             _dispatch_reply(channel, chat_id, "⚡ 硬接线执行中（绕过LLM，直接跑Python脚本）…", request_id=request_id)
