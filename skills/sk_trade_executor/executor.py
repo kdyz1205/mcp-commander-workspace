@@ -109,6 +109,17 @@ class TradeExecutor:
 
     # ── Public API ──
 
+    # Symbol → Solana address mapping (for wallet + DexScreener lookups)
+    _SYMBOL_MAP = {
+        "SOL": "So11111111111111111111111111111111111111112",
+        "USDC": "USDC",
+        "USDT": "USDT",
+    }
+
+    def _resolve_token(self, token: str) -> str:
+        """Resolve short symbol to full address if known."""
+        return self._SYMBOL_MAP.get(token.upper(), token)
+
     def execute_swap(
         self,
         token_in: str,
@@ -126,6 +137,9 @@ class TradeExecutor:
         Raises CircuitBreakerError if consecutive losses >= limit.
         """
         max_slippage = max_slippage or self.DEFAULT_MAX_SLIPPAGE
+        # Resolve short symbols (SOL → full address)
+        token_in = self._resolve_token(token_in)
+        token_out = self._resolve_token(token_out)
 
         # ── Circuit breaker check ──
         if self._consecutive_losses >= self.CIRCUIT_BREAKER_LIMIT:
@@ -146,8 +160,15 @@ class TradeExecutor:
         current_price = price_info["price"]
         liquidity = price_info.get("liquidity", 0)
 
+        # ── Convert amount to USD for slippage calculation ──
+        _STABLES = {"USDC", "USDT", "DAI", "BUSD", "UST"}
+        if token_in.upper() in _STABLES:
+            amount_usd = amount_in  # already in USD
+        else:
+            amount_usd = amount_in * current_price  # e.g. 10 SOL * $80 = $800
+
         # ── Slippage estimation ──
-        estimated_slippage = self._estimate_slippage(amount_in, liquidity)
+        estimated_slippage = self._estimate_slippage(amount_usd, liquidity)
         if estimated_slippage > max_slippage:
             raise SlippageTooHighError(
                 f"预估滑点 {estimated_slippage:.2%} 超过最大允许 {max_slippage:.2%}。"
@@ -228,7 +249,12 @@ class TradeExecutor:
     # ── Price Fetching ──
 
     def _fetch_price(self, token_in: str, token_out: str) -> dict | None:
-        """Fetch current price from DexScreener API."""
+        """Fetch current price from DexScreener API.
+
+        Handles both directions:
+        - Buy (USDC → SOL): search token_out to get its USD price
+        - Sell (SOL → USDC): search token_in to get its USD price (inverted)
+        """
         import urllib.request
         import urllib.error
 
@@ -236,9 +262,19 @@ class TradeExecutor:
         _KNOWN = {
             "SOL": "So11111111111111111111111111111111111111112",
         }
+        _STABLES = {"USDC", "USDT", "DAI", "BUSD", "UST"}
 
-        # Try token_out as address first, then as symbol
-        search = token_out if len(token_out) > 20 else _KNOWN.get(token_out.upper(), token_out)
+        # Determine which token to search:
+        # If selling (token_out is a stable), search token_in for price
+        # If buying (token_in is a stable), search token_out for price
+        if token_out.upper() in _STABLES or token_out in _STABLES:
+            # SELL direction: SOL → USDC — search token_in
+            search_token = token_in
+        else:
+            # BUY direction: USDC → SOL — search token_out
+            search_token = token_out
+
+        search = search_token if len(search_token) > 20 else _KNOWN.get(search_token.upper(), search_token)
 
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{search}"
@@ -323,8 +359,17 @@ class TradeExecutor:
         tx_id = f"sim-{int(time.time()*1000)}"
 
         # Apply slippage to get simulated execution price
+        # Buy (USDC → token): price goes UP (you pay more per token)
+        # Sell (token → USDC): price goes DOWN (you receive less per token)
+        _STABLES = {"USDC", "USDT", "DAI", "BUSD", "UST"}
+        _is_sell = token_out.upper() in _STABLES
         exec_price = price * (1 - slippage)
-        amount_out = amount_in / exec_price if exec_price > 0 else 0
+        if _is_sell:
+            # Selling token for USDC: amount_out = amount_in * exec_price
+            amount_out = amount_in * exec_price
+        else:
+            # Buying token with USDC: amount_out = amount_in / exec_price
+            amount_out = amount_in / exec_price if exec_price > 0 else 0
 
         # Phase 1: Lock funds
         try:
