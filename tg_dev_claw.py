@@ -986,18 +986,29 @@ def main() -> int:
         # Intent classifier decides WHAT to do, not WHICH brain.
         # ══════════════════════════════════════════════════════════════
 
-        if _intent_type in ("chat", "question"):
-            # ── CONVERSATIONAL: question/chat → Claude CLI understands + answers ──
-            _hint = f"{_intent_type}(conf={_intent.confidence:.2f}, {_intent.reasoning})"
-            answer = _ask_claude(text, 60, intent_hint=_hint)
+        if _intent_type == "chat" and _intent.confidence >= 0.6:
+            # ── SIMPLE CHAT: "你好", "1", "哈哈", "ok" → Ollama fast (~0.3s) ──
+            answer = _ask_ollama(text)
             if not answer:
-                # Claude CLI failed → degrade to Ollama
-                answer = _ask_ollama(text)
+                answer = _ask_claude(text, 30)  # degrade up if Ollama fails
             if answer:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
-            # Both brains failed → queue to worker (don't drop silently)
+            _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
+            task_q.put((channel, chat_id, text, request_id))
+            return
+
+        elif _intent_type == "question" or (_intent_type == "chat" and _intent.confidence < 0.6):
+            # ── QUESTION / AMBIGUOUS: needs real understanding → Claude CLI ──
+            _hint = f"{_intent_type}(conf={_intent.confidence:.2f}, {_intent.reasoning})"
+            answer = _ask_claude(text, 60, intent_hint=_hint)
+            if not answer:
+                answer = _ask_ollama(text)  # degrade down if Claude fails
+            if answer:
+                _add_to_history(chat_id, "assistant", answer[:500])
+                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
+                return
             _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
             task_q.put((channel, chat_id, text, request_id))
             return
