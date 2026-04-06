@@ -593,6 +593,36 @@ def main() -> int:
                         append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
                     except Exception:
                         pass
+
+                    # ── Observation Layer: record failure signal ──
+                    try:
+                        from claw_runtime.observation_layer import ObservationLayer
+                        _obs = ObservationLayer()
+                        _obs._make_signal(
+                            task_id=request_id or "unknown",
+                            source="worker", signal_type="task_failure",
+                            severity="error", content=f"{e!s}",
+                            metadata={"instruction": instruction[:200], "model": _task_model},
+                        )
+                    except Exception:
+                        pass
+
+                    # ── Capability Gap Detector: is this a missing capability? ──
+                    try:
+                        from claw_runtime.capability_gap_detector import CapabilityGapDetector
+                        _cgd = CapabilityGapDetector(str(ws_path))
+                        _gaps = _cgd.detect(
+                            task_id=request_id or "unknown",
+                            error_signals=[str(e), traceback.format_exc()],
+                        )
+                        if _gaps:
+                            _gap_summary = "\n".join(f"  • {g.category}: {g.description[:100]}" for g in _gaps[:3])
+                            _dispatch_reply(channel, chat_id,
+                                f"[能力缺口检测]\n{_gap_summary}",
+                                request_id=request_id, kind="status")
+                    except Exception:
+                        pass
+
                     err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
                     _dispatch_reply(channel, chat_id, err, request_id=request_id, kind="error")
                 finally:
