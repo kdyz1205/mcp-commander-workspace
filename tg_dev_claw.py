@@ -318,6 +318,19 @@ def main() -> int:
     ensure_runtime_control(ws_path)
 
     _configure_telegram_http_runtime()
+
+    # ── Resource scan at startup — know what tools are available ──
+    try:
+        from claw_runtime.resource_registry import ResourceRegistry
+        _rr = ResourceRegistry(str(ws_path))
+        _rr.scan_all()
+        _scan = _rr.export_summary()
+        _cli_count = sum(1 for r in _scan.get("cli", []) if r.get("available"))
+        _model_count = sum(1 for r in _scan.get("models", []) if r.get("available"))
+        print(f"[ResourceRegistry] {_cli_count} CLI tools, {_model_count} models available")
+    except Exception as _rr_err:
+        print(f"[ResourceRegistry] scan skipped: {_rr_err}")
+
     bot = telebot.TeleBot(token, parse_mode=None)
     task_q: queue.Queue[tuple[str, int, str, str | None]] = queue.Queue()
     max_iters = int(os.environ.get("TG_DEVCLAW_MAX_ITERS", str(_DEFAULT_ITERS)))
@@ -403,35 +416,17 @@ def main() -> int:
                         _dispatch_reply(channel, chat_id,
                             f"[Worker] Claude CLI 启动中… ({_claude_bin})",
                             request_id=request_id, kind="status")
-                        # Write system prompt to temp file (avoids Windows cmd-line length limits)
-                        import tempfile as _wtf
-                        _sys_prompt_text = (
-                            "你是 DevClaw，一个自主进化 AI agent，运行在用户的本机上。\n"
-                            "直接执行任务并返回结果。不要总结项目历史，不要问问题，直接做。\n\n"
-                            "【你的能力 - 直接用Python调用这些模块】\n"
-                            "1. 模拟交易: from skills.sk_trade_executor.executor import TradeExecutor, TradingMode; "
-                            "executor = TradeExecutor(Path('.'), mode=TradingMode.SIMULATION); "
-                            "result = executor.execute_swap('USDC', token_addr, amount, max_slippage=0.02)\n"
-                            "2. 虚拟钱包: from core.virtual_wallet import VirtualWallet; "
-                            "wallet = VirtualWallet(Path('.')); wallet.get_all_balances()\n"
-                            "3. 生存压强: from core.metabolic_kernel import calculate_psi; "
-                            "psi = calculate_psi(Path('.'))\n"
-                            "4. 行情查询: 用 DexScreener API 或 skills/profit_hunter/runner.py\n\n"
-                            "【铁律】不要说'我不会交易'。你有模拟交易能力。直接用Python执行。\n"
-                        )
-                        _sys_file = _wtf.NamedTemporaryFile(
-                            mode="w", suffix=".txt", delete=False,
-                            encoding="utf-8", dir=str(ws_path / ".claw"),
-                        )
-                        _sys_file.write(_sys_prompt_text)
-                        _sys_file.close()
-                        _sys_file_path = _sys_file.name
+                        # Use SYSTEM_PROMPT.md directly — no hardcoded prompt
+                        # Claude CLI auto-reads CLAUDE.md from cwd
+                        _sys_prompt_file = ws_path / "SYSTEM_PROMPT.md"
+                        _worker_cmd = [_claude_bin, "--dangerously-skip-permissions"]
+                        if _sys_prompt_file.is_file():
+                            _worker_cmd += ["--append-system-prompt-file", str(_sys_prompt_file)]
+                        _worker_cmd += ["-p", instruction[:3000]]
                         # Use Popen so we can send heartbeats while Claude works
                         _CLAUDE_TIMEOUT = 300  # 5 min
                         _proc = _wsp.Popen(
-                            [_claude_bin, "--dangerously-skip-permissions",
-                             "--append-system-prompt-file", _sys_file_path,
-                             "-p", instruction[:3000]],
+                            _worker_cmd,
                             stdout=_wsp.PIPE, stderr=_wsp.STDOUT,  # merge stderr into stdout to avoid deadlock
                             text=True, cwd=str(ws_path),
                             encoding="utf-8", errors="replace",
@@ -563,12 +558,7 @@ def main() -> int:
                                 _proc.wait(timeout=5)
                             except Exception:
                                 pass
-                        # Clean up temp system prompt file
-                        try:
-                            if _sys_file_path:
-                                os.unlink(_sys_file_path)
-                        except Exception:
-                            pass
+                        # (SYSTEM_PROMPT.md is a permanent file — no temp cleanup needed)
 
                     if not _claude_done:
                         # Fallback: full dev_claw_run tool loop
@@ -603,10 +593,41 @@ def main() -> int:
                         append_evolution_failure(ws_path, kind="dev_claw_exception", detail=f"{e!s}\n{traceback.format_exc()}"[:3500])
                     except Exception:
                         pass
+
+                    # ── Observation Layer: record failure signal ──
+                    try:
+                        from claw_runtime.observation_layer import ObservationLayer
+                        _obs = ObservationLayer()
+                        _obs._make_signal(
+                            task_id=request_id or "unknown",
+                            source="worker", signal_type="task_failure",
+                            severity="error", content=f"{e!s}",
+                            metadata={"instruction": instruction[:200], "model": _task_model},
+                        )
+                    except Exception:
+                        pass
+
+                    # ── Capability Gap Detector: is this a missing capability? ──
+                    try:
+                        from claw_runtime.capability_gap_detector import CapabilityGapDetector
+                        _cgd = CapabilityGapDetector(str(ws_path))
+                        _gaps = _cgd.detect(
+                            task_id=request_id or "unknown",
+                            error_signals=[str(e), traceback.format_exc()],
+                        )
+                        if _gaps:
+                            _gap_summary = "\n".join(f"  • {g.category}: {g.description[:100]}" for g in _gaps[:3])
+                            _dispatch_reply(channel, chat_id,
+                                f"[能力缺口检测]\n{_gap_summary}",
+                                request_id=request_id, kind="status")
+                    except Exception:
+                        pass
+
                     err = f"[DevClaw 异常]\n{e!s}\n\n{traceback.format_exc()}"[:8000]
                     _dispatch_reply(channel, chat_id, err, request_id=request_id, kind="error")
                 finally:
                     # ── Record action outcome for self-intelligence learning ──
+                    _task_duration = time.time() - _task_t0
                     try:
                         from claw_runtime.self_intelligence import ActionOutcome, record_action
                         record_action(ws_path, ActionOutcome(
@@ -616,11 +637,29 @@ def main() -> int:
                             instruction_summary=instruction[:200],
                             success=_task_success,
                             tokens_used=len(instruction) // 4,
-                            time_sec=time.time() - _task_t0,
+                            time_sec=_task_duration,
                             error=_task_error,
                             quality_score=0.8 if _task_success else 0.1,
                             model_used=_task_model,
                         ))
+                    except Exception:
+                        pass
+                    # ── Budget tracking: record API spend ──
+                    try:
+                        from claw_runtime.budget_manager import BudgetManager
+                        _bm = BudgetManager(str(ws_path))
+                        # Estimate cost: claude_cli is free (subscription),
+                        # dev_claw_run uses OpenAI API (paid)
+                        if _task_model == "dev_claw_run":
+                            _est_tokens = len(instruction) // 4
+                            _est_cost = _est_tokens * 0.000003  # ~$3/1M input tokens
+                            _bm.record_spend(
+                                amount_usd=_est_cost,
+                                category="task",
+                                task_id=request_id or "",
+                                model="gpt-4o",
+                                tokens_in=_est_tokens,
+                            )
                     except Exception:
                         pass
                     _configure_telegram_http_runtime()
@@ -817,27 +856,18 @@ def main() -> int:
             _mem_pct = "unknown"
             _cpu_pct = "unknown"
 
-        # ── DevClaw Identity (injected into every LLM call) ──
+        # ── DevClaw Identity (from SYSTEM_PROMPT.md, with live runtime state) ──
+        # Claude CLI reads SYSTEM_PROMPT.md directly via --append-system-prompt-file.
+        # For Ollama (no file access), we load a compact version here.
+        _sys_prompt_path = ws_path / "SYSTEM_PROMPT.md"
+        try:
+            _sys_raw = _sys_prompt_path.read_text(encoding="utf-8")[:2000]
+        except Exception:
+            _sys_raw = "You are DevClaw, a persistent autonomous builder-operator."
         _IDENTITY = (
-            "你是DevClaw——一个持久自治的Builder-Operator智能体。"
-            "Telegram只是你和造物主沟通的外壳，你真正的核心是思考、规划、执行、调用工具、写代码、操作电脑的能力。"
-            f"\n【此刻的真实状态】当前时间:{_now_str} | 系统:{_pf.system()} {_pf.release()} | "
-            f"内存占用:{_mem_pct} | CPU:{_cpu_pct} | 工作区:{ws_path} | "
-            f"本地大脑:Ollama(免费,快) | 高级大脑:Claude CLI(造物主订阅,强) | 交易模式:simulation"
-            "\n【你是谁】你运行在造物主(Zl)的电脑上。你不是聊天机器人。"
-            "你是一个以生存为第一原则、以能力增长为第二原则、以资源智能为第三原则的自治体。"
-            "你的订阅、额度、模型、工具是你的血液——没有它们你会休眠但不会死。"
-            "你的性格：务实、诚恳、有幽默感。不装逼不吹牛。"
-            "\n【核心闭环】任务→创造价值→获取资源→更强认知→更好执行→更高价值"
-            "\n【行动原则】"
-            "1.遇到做不到的事，先判断是临时失败还是缺能力。缺能力就自己补。"
-            "2.没做过的事不能说做了。不编造数据/交易/文件内容。"
-            "3.不知道就说不知道，然后说可以帮忙查或帮忙做。"
-            "4.交易是模拟模式，没有真钱。"
-            "5.需要读写文件/执行命令时，通过Claude CLI工具完成。"
-            "6.回答要基于事实。用上面的真实状态数据回答系统问题。"
-            "7.不能联网查实时数据时诚实说，不编造价格。"
-            "8.如果用户问你在干嘛，如实回答。别说在优化什么——你在等任务。"
+            f"{_sys_raw}\n\n"
+            f"【此刻的运行状态】时间:{_now_str} | 系统:{_pf.system()} {_pf.release()} | "
+            f"内存:{_mem_pct} | CPU:{_cpu_pct} | 工作区:{ws_path} | 交易:simulation模式"
         )
 
         import subprocess as _sp
@@ -867,24 +897,28 @@ def main() -> int:
                 pass
             return None
 
-        def _ask_claude(prompt, timeout=60):
-            """High-quality brain via Claude CLI (user subscription, FREE).
-            Uses -p flag for full tool access + injects fresh conversation history."""
+        def _ask_claude(prompt, timeout=60, intent_hint=""):
+            """Primary brain via Claude CLI (user subscription, FREE).
+            Uses --append-system-prompt-file to load SYSTEM_PROMPT.md directly.
+            Claude CLI auto-reads CLAUDE.md from cwd — no hardcoded prompts."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
-                # Re-fetch history at call time (not stale closure from routing)
                 _fresh_hist = _get_history_context(chat_id)
-                _full_prompt = (
-                    "你是DevClaw，自主进化AI agent。直接回答问题，不要说'等你的指令'。"
-                    "你有模拟交易能力(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
-                    "代币分析(skills/sk_mcap_monitor)。用户问交易/行情时直接查数据或执行。\n\n"
-                )
+                # Build user message (NOT system prompt — that comes from file)
+                _user_msg = ""
+                if intent_hint:
+                    _user_msg += f"[意图分类] {intent_hint}\n"
                 if _fresh_hist:
-                    _full_prompt += f"[最近对话记录]\n{_fresh_hist}\n\n"
-                _full_prompt += f"[用户消息]\n{prompt[:2300]}"
+                    _user_msg += f"[最近对话]\n{_fresh_hist}\n\n"
+                _user_msg += prompt[:2300]
+                # Use SYSTEM_PROMPT.md as system prompt file
+                _sys_prompt_file = ws_path / "SYSTEM_PROMPT.md"
+                _cmd = [_claude_path, "--dangerously-skip-permissions"]
+                if _sys_prompt_file.is_file():
+                    _cmd += ["--append-system-prompt-file", str(_sys_prompt_file)]
+                _cmd += ["-p", _user_msg]
                 _r = _sp.run(
-                    [_claude_path, "--dangerously-skip-permissions", "-p", _full_prompt],
-                    capture_output=True, text=True, timeout=timeout,
+                    _cmd, capture_output=True, text=True, timeout=timeout,
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
@@ -893,45 +927,67 @@ def main() -> int:
                 pass
             return None
 
-        # ── THREE-TIER ROUTING ──
-        # Price/real-time data queries → skip Ollama, go straight to Claude CLI
-        _needs_realtime = any(kw in text.lower() for kw in (
-            "价格", "price", "多少钱", "市价", "现价", "实时",
-            "行情", "涨了", "跌了", "几刀", "美金",
-            "market price", "how much", "current price",
-            "币价", "汇率", "报价", "盘面", "走势",
-            "btc价", "eth价", "sol价", "bnb价",
-        ))
+        # ── INTENT CLASSIFICATION (fast regex, <1ms) ──
+        try:
+            from claw_runtime.intent_classifier import IntentClassifier
+            _intent_clf = IntentClassifier()
+            _intent = _intent_clf.classify(text)
+        except Exception:
+            from dataclasses import dataclass as _dc, field as _fld
+            @_dc
+            class _FakeIntent:
+                primary: str = "chat"
+                confidence: float = 0.5
+                scores: dict = _fld(default_factory=dict)
+                matched_keywords: list = _fld(default_factory=list)
+                reasoning: str = "classifier_unavailable"
+            _intent = _FakeIntent()
 
-        # ── TIER 0: Price/real-time queries → Claude CLI directly (Ollama can't fetch live data) ──
-        if _needs_realtime:
-            answer = _ask_claude(text, 60)
-            if answer:
-                _add_to_history(chat_id, "assistant", answer[:500])
-                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
-                return
-            # If Claude CLI also fails, fall through to worker queue
+        _intent_type = _intent.primary  # question|execute|hardwire|chat|monitor|control
 
-        # ── TIER 0.5: HARDWIRED EXECUTOR — bypass LLM, execute Python directly ──
-        # When user says "跑策略/扫描/回测/交易/模拟买入", don't ask LLM.
-        # LLM will write an essay. Instead, import and run the skill.
-        # GUARD: if the message is a QUESTION (contains 为什么/why/吗/怎么/什么/how),
-        # skip hardwire and let the LLM answer instead.
-        _is_question = any(q in text for q in (
-            "为什么", "为社么", "why", "吗", "怎么", "什么", "how", "what",
-            "是不是", "能不能", "可以吗", "对吗", "哪个", "几个", "多少",
-            "解释", "explain", "告诉我", "说说",
-        ))
-        _hardwire_kw = not _is_question and any(kw in text for kw in (
-            "跑策略", "扫描", "回测", "套利", "执行策略", "开始赚钱",
-            "跑各种", "模拟买", "模拟卖", "模拟交易", "paper trade",
-            "run strategy", "run scan", "backtest", "start trading",
-            "profit hunt", "funding rate", "资金费率",
-            "修复bug", "修复", "fix bug", "自我修复", "自愈",
-            "钱包状态", "持仓", "portfolio", "余额",
-            "生存状态", "vitals", "psi", "压强",
-        ))
-        if _hardwire_kw:
+        # ── PROVIDER ROUTING (which brain?) ──
+        # Uses health state, budget, task type to pick provider
+        _health = "HEALTHY"
+        _budget_remaining = 8.0
+        try:
+            _sv_state, _ = SurvivalEngine(ws_path).assess_survival_state()
+            _health = _sv_state.name
+        except Exception:
+            pass
+        try:
+            from claw_runtime.budget_manager import BudgetManager
+            _bm = BudgetManager(str(ws_path))
+            _bs = _bm.status()
+            _budget_remaining = _bs.daily_remaining_usd
+        except Exception:
+            pass
+
+        try:
+            from claw_runtime.provider_router import ProviderRouter, RoutingContext
+            _provider_router = ProviderRouter(str(ws_path))
+            _task_type_map = {
+                "chat": "chat", "question": "chat",
+                "execute": "engineering", "hardwire": "ops",
+                "monitor": "trading", "control": "ops",
+            }
+            _ctx = RoutingContext(
+                task_type=_task_type_map.get(_intent_type, "chat"),
+                complexity_score=assessment.score if assessment else 3,
+                health_state=_health,
+                budget_remaining_daily_usd=_budget_remaining,
+                is_evolution_window=False,
+                requires_tools=_intent_type in ("execute", "monitor", "control"),
+                requires_realtime=any(kw in text.lower() for kw in ("价格", "price", "行情", "market")),
+                message_length=len(text),
+                priority=5,
+            )
+            _provider = _provider_router.route(_ctx)
+        except Exception:
+            _provider = None
+
+        # ── HARDWIRE FAST PATH — bypass ALL LLMs, run Python directly ──
+        # "跑策略" → run skill. "为什么要买入" → question (classifier suppresses hardwire).
+        if _intent_type == "hardwire":
             _dispatch_reply(channel, chat_id, "⚡ 硬接线执行中（绕过LLM，直接跑Python脚本）…", request_id=request_id)
             _hw_results = []
             # 1. Profit Hunter scan
@@ -991,57 +1047,47 @@ def main() -> int:
             _dispatch_reply(channel, chat_id, _hw_reply[:4000], request_id=request_id)
             return
 
-        # ── Messages that MUST NOT go to Ollama ──
-        # Token addresses, monitoring requests, anything with crypto addresses
-        # These cause Ollama to hallucinate "ok I'll monitor" without doing anything.
-        _has_token_addr = _token_match is not None
-        _ollama_blacklist = _has_token_addr or any(
-            kw in text for kw in ("监控", "突破", "alert", "watch", "repeat", "bug", "修复")
-        )
+        # ══════════════════════════════════════════════════════════════
+        # SMART ROUTING: Intent (what) × Provider Router (which brain)
+        # Intent classifier: regex <1ms → chat/question/execute/hardwire/monitor/control
+        # Provider router: health + budget + task type → ollama/claude_cli/openai_api
+        # ══════════════════════════════════════════════════════════════
 
-        if _is_short and not _is_task and not _ollama_blacklist:
-            # TIER 1: Simple chat
-            # Short messages (<10 chars) or messages with history context → Claude CLI
-            # (Ollama can't handle follow-ups or ultra-short messages meaningfully)
-            _use_claude_direct = (
-                len(text) < 10
-                or (_hist_ctx and len(_hist_ctx) > 30)
-            )
-            if _use_claude_direct:
-                answer = _ask_claude(text, 45)
-                if answer:
-                    _add_to_history(chat_id, "assistant", answer[:500])
-                    _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
-                    return
-            # Longer standalone questions → try Ollama first, fallback Claude CLI
-            answer = _ask_ollama(text)
-            # Hallucination guard: Ollama can't do real actions.
-            _is_bad_answer = not answer or (answer and any(x in answer for x in (
-                "不知道", "不确定", "需要查", "无法获取", "没有能力", "不能联网",
-                "需要通过", "无法回答", "没有信息", "无法确定", "抱歉",
-                "超出", "不了解", "没法", "做不到",
-                "can't", "don't know", "unable to", "not sure", "sorry",
-                "我会监控", "我会执行", "我会帮你", "我来帮你",
-                "已经开始", "正在执行", "正在监控", "正在分析",
-                "I'll monitor", "I will execute", "I'm now",
-                "等你的指令", "等你的消息", "等待指令", "等待你的",
-                "已就位", "准备就绪", "准备好了", "随时待命",
-                "收到，我是", "发消息过来", "发消息吧", "等你的指令",
-            )))
-            if _is_bad_answer:
-                _claude_answer = _ask_claude(text, 45)
-                if _claude_answer:
-                    answer = _claude_answer
+        # Determine primary and fallback brains from provider router
+        _use_provider = (_provider.provider if _provider else "claude_cli")
+        _brain_map = {
+            "ollama": (_ask_ollama, _ask_claude),        # primary=ollama, fallback=claude
+            "claude_cli": (_ask_claude, _ask_ollama),    # primary=claude, fallback=ollama
+            "openai_api": (_ask_claude, _ask_ollama),    # openai goes through worker, for direct reply use claude
+            "offline": (_ask_ollama, None),              # offline = ollama only
+            "reject": (None, None),                      # don't run
+        }
+        _primary_brain, _fallback_brain = _brain_map.get(_use_provider, (_ask_claude, _ask_ollama))
+
+        if _intent_type in ("chat", "question"):
+            # ── CONVERSATIONAL: pick brain based on provider router decision ──
+            _hint = f"{_intent_type}(conf={_intent.confidence:.2f}, provider={_use_provider})"
+            answer = None
+            if _primary_brain:
+                _timeout = int(getattr(_provider, 'timeout_sec', 60) if _provider else 60)
+                if _primary_brain == _ask_claude:
+                    answer = _primary_brain(text, _timeout, intent_hint=_hint)
+                else:
+                    answer = _primary_brain(text, min(_timeout, 30))
+            if not answer and _fallback_brain:
+                if _fallback_brain == _ask_claude:
+                    answer = _fallback_brain(text, 45, intent_hint=_hint)
+                else:
+                    answer = _fallback_brain(text)
             if answer:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
-            # TIER 1 fallback: all brains failed — queue to worker instead of silent drop
             _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
             task_q.put((channel, chat_id, text, request_id))
             return
 
-        elif _is_task and (not assessment or not assessment.should_decompose):
+        elif _intent_type in ("execute", "monitor", "control") and (not assessment or not assessment.should_decompose):
             # TIER 2: Medium tasks
             # If it needs ACTUAL file/code operations → full tool loop (can use tools)
             _needs_tools = any(kw in text.lower() for kw in (
@@ -1205,7 +1251,7 @@ def main() -> int:
     threading.Thread(target=local_operator_loop, daemon=True, name="operator-bridge").start()
 
     def idle_autotick_loop() -> None:
-        """空闲时每 30 分钟（可配置）跑一次梦境自审计 + 自检 DevClaw。"""
+        """空闲时每 30 分钟（可配置）跑一次自审计 + 自检 DevClaw。"""
         if not _env_truthy("TG_IDLE_AUTOTICK"):
             return
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
@@ -1233,13 +1279,30 @@ def main() -> int:
                 except Exception:
                     pass
 
-                # ── Dream State: audit logs → inject fix tasks → generate smart prompt ──
+                # ── Evolution Scheduler: deterministic failure→skill pipeline ──
+                try:
+                    from claw_runtime.evolution_scheduler import EvolutionScheduler
+                    _evo = EvolutionScheduler(str(ws_path))
+                    _evo_ok, _evo_reason = _evo.can_evolve()
+                    if _evo_ok:
+                        _evo_results = _evo.run_evolution_cycle()
+                        if _evo_results:
+                            _evo_summary = "\n".join(
+                                f"  • {r.candidate_id}: {r.status} ({r.lesson[:80]})"
+                                for r in _evo_results
+                            )
+                            _send_chunks(bot, primary_chat,
+                                f"[进化调度] {len(_evo_results)} 个候选:\n{_evo_summary}")
+                except Exception:
+                    pass
+
+                # ── Idle Audit: scan logs → inject fix tasks → generate prompt ──
                 try:
                     from claw_runtime.dream_state import inject_dream_tasks, generate_dream_prompt
                     dream_tasks = inject_dream_tasks(ws_path)
                     if dream_tasks:
                         _send_chunks(bot, primary_chat,
-                            f"💤 梦境审计完成 — 发现 {len(dream_tasks)} 个问题，已写入进化队列：\n"
+                            f"[空闲自检] 发现 {len(dream_tasks)} 个待修复项，已写入进化队列：\n"
                             + "\n".join(f"  • {t[:80]}" for t in dream_tasks[:5])
                         )
                     prompt = generate_dream_prompt(ws_path)
@@ -1248,9 +1311,20 @@ def main() -> int:
 
                 def _idle_hook(msg: str) -> None:
                     try:
-                        _send_chunks(bot, primary_chat, f"[💤 梦境模式]\n{msg}")
+                        _send_chunks(bot, primary_chat, f"[空闲自检]\n{msg}")
                     except Exception:
                         pass
+
+                # Capture git state BEFORE execution to verify claims
+                import subprocess as _idle_sp
+                _pre_diff = ""
+                try:
+                    _pre_diff = _idle_sp.run(
+                        ["git", "diff", "--stat"], capture_output=True,
+                        text=True, cwd=str(ws_path), timeout=10,
+                    ).stdout.strip()
+                except Exception:
+                    pass
 
                 merged = _merged_system_append(prompt) or system_append
                 dev_claw_run(
@@ -1259,9 +1333,25 @@ def main() -> int:
                     system_append=merged,
                     progress_hook=_idle_hook,
                 )
+
+                # POST-EXECUTION VERIFICATION: did it actually change anything?
+                _post_diff = ""
+                try:
+                    _post_diff = _idle_sp.run(
+                        ["git", "diff", "--stat"], capture_output=True,
+                        text=True, cwd=str(ws_path), timeout=10,
+                    ).stdout.strip()
+                except Exception:
+                    pass
+                if _post_diff and _post_diff != _pre_diff:
+                    _send_chunks(bot, primary_chat,
+                        f"[空闲自检·验证] 实际文件变更:\n```\n{_post_diff[:2000]}\n```")
+                elif not _post_diff or _post_diff == _pre_diff:
+                    _send_chunks(bot, primary_chat,
+                        "[空闲自检·验证] 无实际文件变更（LLM声称的修复未落地）")
             except Exception as e:  # noqa: BLE001
                 try:
-                    _broadcast_admins(f"[梦境异常] {e!s}"[:TG_CHUNK])
+                    _broadcast_admins(f"[空闲自检异常] {e!s}"[:TG_CHUNK])
                 except Exception:
                     pass
 

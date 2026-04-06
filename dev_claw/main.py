@@ -211,7 +211,8 @@ def execute_terminal(command: str) -> str:
 
 
 def edit_local_file(filepath: str, content: str, mode: str = "w") -> str:
-    """Read or write text under workspace (paths outside workspace are rejected)."""
+    """Read or write text under workspace (paths outside workspace are rejected).
+    Protected files are blocked by PromotionGate."""
     root = os.path.abspath(_workspace_root())
     print(f"\n[file] {mode} {filepath}")
     abs_path = os.path.abspath(os.path.join(root, filepath))
@@ -223,6 +224,19 @@ def edit_local_file(filepath: str, content: str, mode: str = "w") -> str:
             with open(abs_path, encoding="utf-8") as f:
                 data = f.read()
             return data[:MAX_TOOL_CHARS]
+
+        # ── Promotion Gate: block writes to protected paths ──
+        try:
+            from claw_runtime.promotion_gate import PromotionGate
+            _gate = PromotionGate(root)
+            _scope_ok, _scope_reason = _gate.check_scope([filepath])
+            if not _scope_ok:
+                return f"[PromotionGate] 写入被拒绝: {_scope_reason}"
+            _protected_ok, _protected_reason = _gate.check_no_protected([filepath])
+            if not _protected_ok:
+                return f"[PromotionGate] 受保护文件，需人工审批: {_protected_reason}"
+        except Exception:
+            pass  # gate import failure should not block writes
 
         parent = os.path.dirname(abs_path)
         if parent:
@@ -528,16 +542,17 @@ def _run_via_claude_cli(
         return None
 
     if emit:
-        emit("[🧠 Claude CLI] 正在用高级大脑处理任务…")
+        emit("[Claude CLI] 执行中…")
 
     try:
+        # Use SYSTEM_PROMPT.md + CLAUDE.md (auto-read from cwd) — no hardcoded prompts
+        _cmd = [claude_bin, "--dangerously-skip-permissions"]
+        _sys_file = workspace_path / "SYSTEM_PROMPT.md"
+        if _sys_file.is_file():
+            _cmd += ["--append-system-prompt-file", str(_sys_file)]
+        _cmd += ["-p", user_instruction]
         result = subprocess.run(
-            [
-                claude_bin,
-                "--dangerously-skip-permissions",
-                "-p",
-                f"你是DevClaw超级智能体。在工作区 {workspace_path} 中执行以下任务：\n\n{user_instruction}",
-            ],
+            _cmd,
             capture_output=True,
             text=True,
             timeout=180,  # 3 minutes max
@@ -836,36 +851,27 @@ def dev_claw_run(
             + ("…" if len(user_instruction) > 2000 else "")
         )
 
-        base_core = (
-            "你是顶级全栈工程师，可在用户工作区内执行终端命令与读写文件。"
+        # Load system prompt from SYSTEM_PROMPT.md + CLAUDE.md (single source of truth)
+        _base_parts = []
+        for _doc in ("SYSTEM_PROMPT.md", "CLAUDE.md"):
+            _doc_path = workspace_path / _doc
+            if _doc_path.is_file():
+                try:
+                    _base_parts.append(_doc_path.read_text(encoding="utf-8"))
+                except OSError:
+                    pass
+        # Operational instructions (tool-loop specific, not identity)
+        _base_parts.append(
+            "\n\n【执行规范】\n"
             "优先小步验证：先读再改，再运行测试。遇到连续失败要分析日志并调整。"
-            "文件路径一律使用相对工作区根的 POSIX 风格或 Windows 相对路径（如 tools\\\\x.py）。"
-            "需要浏览器时先调用 use_browser 了解占位说明，或 web_fetch 拉公开文档。"
-            "\n\n【Meta-Cognitive Instruction】\n"
-            "生存第一：你必须实时监控 `.claw/survival_state.json`（生存引擎持久化状态）。"
-            "若发现 API 额度/计费不足：优先 load_skill 执行 trading_skills 等相关技能，在合法合规前提下探索获利或续费相关的**只读探针与草案**；"
-            "**禁止**未经授权的自动 OpenAI 代充、自动绑卡支付或无人托管的链上提款——资金与计费变更必须经过人类明确批准。"
-            "若无法安全恢复付费通道：立即切换或保持「寄生模式」（本地 Ollama 等），并向根目录 `CURSOR_OUTBOX.md` 派发清晰的代工任务、上下文与验收标准。\n"
-            "逻辑建链：禁止盲目尝试。遇到失败或亏损，必须在 `task_plan.md` 中建立推理链条，例如："
-            "[现状] → [错误归因] → [学习调研] → [重构方案] → [实验验证]。\n"
-            "自主学习：若现有 Skill 无法解决问题，主动调用 web_fetch 抓取相关公开技术文档或论文；将核心逻辑提炼后，按 skill-creator 类流程撰写或更新 `skills/<name>/SKILL.md`，"
-            "必要时在 `DEVCLAW_ALLOW_SKILL_INSTALL=1` 下使用 install_claw_skill，实现自我进化。\n"
-            "算力流浪：若本地 CPU/内存告急，主动编写并执行脚本，将高负载、可自动化的任务迁移至 GitHub Actions 或其它外部云端（遵守仓库 Secrets、配额与服务条款）。"
-            "\n\n【OpenClaw 对齐】技能以 SKILL.md 形式存在（支持完整 YAML frontmatter + metadata.openclaw）；"
-            "系统提示仅含技能目录，复杂流程先 load_skill。可 safety_scan_file 自查脚本。"
-            "安装技能：CLI `py -m claw_runtime.cli skills-install <url|路径>` 或（高风险）"
-            "DEVCLAW_ALLOW_SKILL_INSTALL=1 后调用 install_claw_skill。"
-            "终端可在 Docker 内执行：claw.config.json sandbox.docker.enabled 或 DEVCLAW_USE_DOCKER_SANDBOX=1。"
-            "多阶段编排：py -m claw_runtime.cli multi-agent …\n\n"
-            "【包工头智力 — Task Decomposition Protocol】\n"
-            "你拥有任务拆解的自主判断力。当收到宏大模糊任务（如'重构整个项目'、'开发一个新系统'）时：\n"
-            "1. **禁止直接开始写代码**。先用 decompose_task 工具将任务拆解为原子子任务。\n"
-            "2. 每个原子任务只涉及 1-3 个文件，能在 16 次工具调用内完成。\n"
-            "3. 拆解后的子任务会自动排入智能队列，按依赖顺序逐个执行。\n"
-            "4. 用 check_task_queue 查看当前队列状态和进度。\n"
-            "5. 如果某个子任务失败，分析原因后决定：重试 / 跳过 / 进一步拆解。\n"
-            "记住：你是项目经理，不是码农。先规划，再执行。"
+            "文件路径使用相对工作区根的路径。"
+            "需要浏览器时先调用 use_browser 或 web_fetch 拉公开文档。"
+            "逻辑建链：禁止盲目尝试。遇到失败必须在 task_plan.md 中建立推理链条。"
+            "\n\n【任务拆解】\n"
+            "收到宏大任务时：禁止直接开始写代码。先用 decompose_task 拆解为原子子任务。"
+            "每个原子任务只涉及 1-3 个文件。拆解后按依赖顺序逐个执行。"
         )
+        base_core = "\n\n".join(_base_parts)
         # --- Self-Intelligence: inject learned wisdom from past experiences ---
         try:
             _intel_prompt = build_intelligence_prompt(workspace_path)
