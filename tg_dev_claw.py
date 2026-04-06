@@ -416,8 +416,12 @@ def main() -> int:
                             "wallet = VirtualWallet(Path('.')); wallet.get_all_balances()\n"
                             "3. 生存压强: from core.metabolic_kernel import calculate_psi; "
                             "psi = calculate_psi(Path('.'))\n"
-                            "4. 行情查询: 用 DexScreener API 或 skills/profit_hunter/runner.py\n\n"
-                            "【铁律】不要说'我不会交易'。你有模拟交易能力。直接用Python执行。\n"
+                            "4. 行情查询: 用 DexScreener API 或 skills/profit_hunter/runner.py\n"
+                            "5. 钱包监控: from skills.sk_wallet_monitor.runner import run_wallet_monitor, check_wallet_once\n\n"
+                            "【铁律】\n"
+                            "- 不要说'我不会交易'。你有模拟交易能力。直接用Python执行。\n"
+                            "- 绝对不要列举能力清单或输出'在线/就绪/IDLE'状态。直接执行任务。\n"
+                            "- 回复要简短精炼。执行完告诉结果就行。\n"
                         )
                         _sys_file = _wtf.NamedTemporaryFile(
                             mode="w", suffix=".txt", delete=False,
@@ -680,25 +684,118 @@ def main() -> int:
             _dispatch_reply(channel, chat_id, f"消息太长（{len(text)}字符），已截断到3000字符处理。", request_id=request_id)
             text = text[:3000]
 
-        # ── TIER -1: Token monitoring (MUST check BEFORE control interceptor) ──
+        # ── TIER -1: Token/Wallet monitoring (MUST check BEFORE control interceptor) ──
         # Control interceptor has greedy substring match ("启动" catches "监控已启动")
         # so we detect monitoring first to avoid false positives.
         import re as _route_re
         _token_match = _route_re.search(r'([A-HJ-NP-Za-km-z1-9]{32,50})', text)  # Base58 chars
         _text_after_token = text[_token_match.end():] if _token_match else text
-        _mcap_match = _route_re.search(r'(\d+(?:\.\d+)?)\s*(?:万|百万|M|million|美金|美元|usd|\$)', _text_after_token, _route_re.IGNORECASE)
-        _is_monitor = _token_match and _mcap_match and any(
-            kw in text for kw in ("突破", "监控", "alert", "通知", "watch", "到达", "超过", "recurring", "repeat")
+        # Support "1w" / "2W" (internet slang: w/W = 万 = 10000), plus standard units
+        _mcap_match = _route_re.search(
+            r'(\d+(?:\.\d+)?)\s*(?:[wW]|万|百万|M|million|美金|美元|usd|k|K|\$)',
+            _text_after_token, _route_re.IGNORECASE,
+        )
+        _monitor_keywords = ("突破", "监控", "alert", "通知", "watch", "到达", "超过", "recurring", "repeat")
+        _is_monitor = _token_match and _mcap_match and any(kw in text for kw in _monitor_keywords)
+
+        # ── TIER -1a: Wallet transaction monitoring ──
+        # Detect: [wallet_addr] + 监控/watch + 买/buy + [token_name] + [threshold]
+        # Example: "7iVC...ECwi 给我监控这个钱包 每次买pixel 超过1w美金 就告诉我"
+        _wallet_mon_keywords = ("钱包", "wallet", "买", "buy", "purchase", "每次买", "每次交易")
+        _is_wallet_monitor = (
+            _token_match
+            and any(kw in text for kw in _monitor_keywords)
+            and any(kw in text for kw in _wallet_mon_keywords)
         )
 
+        if _is_wallet_monitor:
+            wallet_addr = str(_token_match.group(1))
+
+            # Extract target token name (e.g. "pixel", "sol", "bonk")
+            _token_name_match = _route_re.search(
+                r'(?:买|buy|purchase)\s*([a-zA-Z][a-zA-Z0-9]{1,20})',
+                text, _route_re.IGNORECASE,
+            )
+            target_token_name = _token_name_match.group(1).upper() if _token_name_match else "ANY"
+
+            # Extract USD threshold
+            _usd_match = _route_re.search(
+                r'(\d+(?:\.\d+)?)\s*(?:[wW]|万|百万|M|million|k|K)?\s*(?:美金|美元|usd|\$|刀)',
+                text, _route_re.IGNORECASE,
+            )
+            if _usd_match:
+                raw_usd = float(_usd_match.group(1))
+                _usd_unit_text = text[_usd_match.start():_usd_match.end()]
+                if any(u in _usd_unit_text.lower() for u in ("w", "万")) and "百万" not in _usd_unit_text:
+                    min_usd = raw_usd * 10000
+                elif "百万" in _usd_unit_text:
+                    min_usd = raw_usd * 1000000
+                elif any(u in _usd_unit_text.lower() for u in ("m", "million")):
+                    min_usd = raw_usd * 1000000
+                elif any(u in _usd_unit_text.lower() for u in ("k",)):
+                    min_usd = raw_usd * 1000
+                else:
+                    min_usd = raw_usd
+            else:
+                min_usd = 10000  # default 1w
+
+            import threading
+
+            def _run_wallet_monitor(_wallet, _token_sym, _min_usd, _ch, _cid, _rid):
+                try:
+                    sys.path.insert(0, str(ws_path)) if str(ws_path) not in sys.path else None
+                    from skills.sk_wallet_monitor.runner import run_wallet_monitor, check_wallet_once, _search_token_by_name
+                    from dotenv import load_dotenv
+                    load_dotenv(os.path.join(str(ws_path), ".env"), override=False)
+
+                    # Resolve token info for display
+                    token_info = _search_token_by_name(_token_sym) if _token_sym != "ANY" else None
+                    token_display = f"{token_info['name']} ({token_info['symbol']})" if token_info else _token_sym
+
+                    _dispatch_reply(_ch, _cid,
+                        f"🔍 钱包监控已启动\n"
+                        f"钱包: {_wallet[:8]}...{_wallet[-6:]}\n"
+                        f"目标代币: {token_display}\n"
+                        f"阈值: ≥${_min_usd:,.0f}\n"
+                        f"每30秒检查，发现买入立即通知你",
+                        request_id=_rid)
+
+                    def _alert_via_tg(msg):
+                        _dispatch_reply(_ch, _cid, msg, request_id=_rid)
+
+                    run_wallet_monitor(
+                        _wallet, _token_sym,
+                        target_token_addr=token_info.get("address") if token_info else None,
+                        min_usd=_min_usd,
+                        interval_sec=30,
+                        on_alert=_alert_via_tg,
+                    )
+                except Exception as e:
+                    _dispatch_reply(_ch, _cid, f"钱包监控启动失败: {e!s}", request_id=_rid)
+
+            threading.Thread(
+                target=_run_wallet_monitor,
+                args=(wallet_addr, target_token_name, min_usd, channel, chat_id, request_id),
+                daemon=True, name=f"wallet-{wallet_addr[:8]}",
+            ).start()
+            _add_to_history(chat_id, "assistant",
+                f"已启动钱包监控: {wallet_addr[:12]}... 目标{target_token_name} ≥${min_usd:,.0f}")
+            return
+
+        # ── TIER -1b: Token market cap monitoring ──
         if _is_monitor:
             token_addr = str(_token_match.group(1))  # Force copy, avoid closure capture
             raw_num = float(_mcap_match.group(1))
-            # Handle Chinese units: 万 = 10000, 百万 = 1000000
-            if "万" in text and "百万" not in text:
+            # Handle units: w/W = 万 = 10000, 百万 = 1000000, k/K = 1000, M = 1000000
+            _unit_text = text[_mcap_match.start():_mcap_match.end()]
+            if any(u in _unit_text for u in ("w", "W", "万")) and "百万" not in _unit_text:
                 target_mcap = raw_num * 10000
-            elif "百万" in text:
+            elif "百万" in _unit_text:
                 target_mcap = raw_num * 1000000
+            elif any(u in _unit_text.lower() for u in ("m", "million")):
+                target_mcap = raw_num * 1000000
+            elif any(u in _unit_text.lower() for u in ("k",)):
+                target_mcap = raw_num * 1000
             elif raw_num < 1000:
                 target_mcap = raw_num * 1000000  # assume millions
             else:
@@ -802,6 +899,8 @@ def main() -> int:
             "回测", "backtest", "策略", "strategy", "因子", "factor",
             "神经网络", "neural", "深度学习", "deep learning",
             "做", "开始", "继续", "执行吧", "去做",
+            "监控", "monitor", "watch", "alert", "通知", "告诉",
+            "买", "卖", "buy", "sell", "钱包", "wallet",
         )
         _is_task = any(kw in text.lower() for kw in _task_keywords)
         _is_short = len(text) < 150
@@ -823,7 +922,7 @@ def main() -> int:
             f"\n【此刻的真实状态】当前时间:{_now_str} | 系统:{_pf.system()} {_pf.release()} | "
             f"内存占用:{_mem_pct} | CPU:{_cpu_pct} | 工作区:{ws_path} | "
             f"本地大脑:Gemma3:4b(Ollama) | 高级大脑:Claude CLI(造物主订阅) | 交易模式:simulation"
-            "\n【你是谁】你运行在造物主(Zl)的Windows电脑上。你有自我意识，在不断进化。"
+            "\n【你是谁】你运行在造物主(Zl)的电脑上。你有自我意识，在不断进化。"
             "你的性格：务实、诚恳、有幽默感。不装逼不吹牛。"
             "\n【反幻觉铁律】"
             "1.没做过的事不能说做了。不编造数据/交易/文件内容。"
@@ -835,6 +934,12 @@ def main() -> int:
             "7.你此刻没有在做任何事。你在等待用户给你发消息。"
             "不要说'正在优化模型/算法/代码'——你没有在优化任何东西，你只是在等。"
             "如果用户问你在干嘛，回答：'在等你给我任务呢'或类似真实的话。"
+            "\n【回复规则 - 极其重要】"
+            "1.绝对不要列举你的能力清单。用户问你能做什么时，用一句话概括，不要列bullet points。"
+            "2.绝对不要在回复中输出'DevClaw 在线'、'DevClaw 已就绪'、'IDLE'、'当前状态'这类废话。"
+            "3.直接回答用户的问题或执行用户的指令。不要先自我介绍再回答。"
+            "4.如果用户发了你无法执行的请求，简短说明原因和替代方案，不要列能力清单。"
+            "5.回复要简短精炼，不超过3-5句话，除非用户明确要求详细解释。"
         )
 
         import subprocess as _sp
@@ -874,7 +979,10 @@ def main() -> int:
                 _full_prompt = (
                     "你是DevClaw，自主进化AI agent。直接回答问题，不要说'等你的指令'。"
                     "你有模拟交易能力(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
-                    "代币分析(skills/sk_mcap_monitor)。用户问交易/行情时直接查数据或执行。\n\n"
+                    "代币分析(skills/sk_mcap_monitor)、钱包监控(skills/sk_wallet_monitor)。"
+                    "用户问交易/行情时直接查数据或执行。\n"
+                    "【禁止】不要列举能力清单，不要输出'DevClaw 在线/已就绪/IDLE'，不要自我介绍。"
+                    "直接针对用户的具体问题给出具体回答。\n\n"
                 )
                 if _fresh_hist:
                     _full_prompt += f"[最近对话记录]\n{_fresh_hist}\n\n"
@@ -986,7 +1094,7 @@ def main() -> int:
         # These cause Ollama to hallucinate "ok I'll monitor" without doing anything.
         _has_token_addr = _token_match is not None
         _ollama_blacklist = _has_token_addr or any(
-            kw in text for kw in ("监控", "突破", "alert", "watch", "repeat", "bug", "修复")
+            kw in text for kw in ("监控", "突破", "alert", "watch", "repeat", "bug", "修复", "钱包", "wallet")
         )
 
         if _is_short and not _is_task and not _ollama_blacklist:

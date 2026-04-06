@@ -84,6 +84,13 @@
       "path": "skills/treasury_ops/SKILL.md",
       "invoke": "py skills\\\\treasury_ops\\\\runner.py --action dashboard --workspace .",
       "notes": "Proposal-only; human approval required for transfers. Balances, burn rate, PnL, renewal proposals."
+    },
+    {
+      "id": "sk_wallet_monitor",
+      "title": "Solana 钱包交易监控（买入提醒）",
+      "path": "skills/sk_wallet_monitor/runner.py",
+      "invoke": "py skills/sk_wallet_monitor/runner.py <wallet_address> <token_symbol> <min_usd>",
+      "notes": "监控指定钱包的链上交易。支持 Helius API (需 HELIUS_API_KEY) 或基础 Solana RPC。每30秒轮询，买入超阈值时 TG 推送。"
     }
   ]
 }
