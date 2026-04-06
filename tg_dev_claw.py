@@ -867,21 +867,24 @@ def main() -> int:
                 pass
             return None
 
-        def _ask_claude(prompt, timeout=60):
-            """High-quality brain via Claude CLI (user subscription, FREE).
-            Uses -p flag for full tool access + injects fresh conversation history."""
+        def _ask_claude(prompt, timeout=60, intent_hint=""):
+            """Primary brain via Claude CLI (user subscription, FREE).
+            Uses -p flag for full tool access + injects conversation history + intent."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
-                # Re-fetch history at call time (not stale closure from routing)
                 _fresh_hist = _get_history_context(chat_id)
                 _full_prompt = (
-                    "你是DevClaw，自主进化AI agent。直接回答问题，不要说'等你的指令'。"
-                    "你有模拟交易能力(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
-                    "代币分析(skills/sk_mcap_monitor)。用户问交易/行情时直接查数据或执行。\n\n"
+                    "你是DevClaw，持久自治Builder-Operator。\n"
+                    "核心原则：直接回答、直接执行、不说废话。\n"
+                    "能力：模拟交易(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
+                    "代币分析(skills/sk_mcap_monitor)、终端执行、文件读写、代码修改。\n"
+                    "规则：不编造数据，不说'等你的指令'，做不到就说做不到然后说能做什么。\n"
                 )
+                if intent_hint:
+                    _full_prompt += f"[意图分类] {intent_hint}\n"
                 if _fresh_hist:
-                    _full_prompt += f"[最近对话记录]\n{_fresh_hist}\n\n"
-                _full_prompt += f"[用户消息]\n{prompt[:2300]}"
+                    _full_prompt += f"\n[最近对话]\n{_fresh_hist}\n"
+                _full_prompt += f"\n[用户消息]\n{prompt[:2300]}"
                 _r = _sp.run(
                     [_claude_path, "--dangerously-skip-permissions", "-p", _full_prompt],
                     capture_output=True, text=True, timeout=timeout,
@@ -893,17 +896,15 @@ def main() -> int:
                 pass
             return None
 
-        # ── INTENT-BASED ROUTING ──
-        # Uses scoring-based IntentClassifier: regex fast path + optional LLM fallback
+        # ── INTENT CLASSIFICATION (fast regex, <1ms) ──
+        # Determines message TYPE, not which brain to use.
+        # Claude CLI is the DEFAULT brain for everything (subscription = already paid).
+        # Ollama is ONLY a degraded fallback when Claude CLI is down.
         try:
             from claw_runtime.intent_classifier import IntentClassifier
             _intent_clf = IntentClassifier()
-            # Build a lightweight LLM function for ambiguous cases
-            def _llm_classify(prompt):
-                return _ask_ollama(prompt, timeout=10)
-            _intent = _intent_clf.classify_with_llm_fallback(text, llm_fn=_llm_classify)
+            _intent = _intent_clf.classify(text)
         except Exception:
-            # Fallback: treat as chat if classifier import fails
             from dataclasses import dataclass as _dc, field as _fld
             @_dc
             class _FakeIntent:
@@ -916,26 +917,8 @@ def main() -> int:
 
         _intent_type = _intent.primary  # question|execute|hardwire|chat|monitor|control
 
-        # Price/real-time data queries → Claude CLI directly (Ollama can't fetch live data)
-        _needs_realtime = any(kw in text.lower() for kw in (
-            "价格", "price", "多少钱", "市价", "现价", "实时",
-            "行情", "涨了", "跌了", "几刀", "美金",
-            "market price", "how much", "current price",
-            "币价", "汇率", "报价", "盘面", "走势",
-            "btc价", "eth价", "sol价", "bnb价",
-        ))
-
-        # ── TIER 0: Price/real-time queries → Claude CLI directly ──
-        if _needs_realtime:
-            answer = _ask_claude(text, 60)
-            if answer:
-                _add_to_history(chat_id, "assistant", answer[:500])
-                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
-                return
-
-        # ── TIER 0.5: HARDWIRED EXECUTOR — bypass LLM, execute Python directly ──
-        # IntentClassifier already handles question suppression:
-        # "为什么要买入" → question (not hardwire), "跑策略" → hardwire
+        # ── HARDWIRE FAST PATH — bypass ALL LLMs, run Python directly ──
+        # "跑策略" → run skill. "为什么要买入" → question (classifier suppresses hardwire).
         if _intent_type == "hardwire":
             _dispatch_reply(channel, chat_id, "⚡ 硬接线执行中（绕过LLM，直接跑Python脚本）…", request_id=request_id)
             _hw_results = []
@@ -996,55 +979,25 @@ def main() -> int:
             _dispatch_reply(channel, chat_id, _hw_reply[:4000], request_id=request_id)
             return
 
-        # ── Messages that MUST NOT go to Ollama ──
-        # Token addresses, monitoring requests, anything with crypto addresses
-        # These cause Ollama to hallucinate "ok I'll monitor" without doing anything.
-        _has_token_addr = _token_match is not None
-        _ollama_blacklist = _has_token_addr or _intent_type in ("monitor", "execute", "control")
+        # ══════════════════════════════════════════════════════════════
+        # CLAUDE-CLI-FIRST ROUTING
+        # Design: Claude CLI = default brain (subscription, already paid).
+        #         Ollama = degraded fallback ONLY when Claude CLI fails.
+        # Intent classifier decides WHAT to do, not WHICH brain.
+        # ══════════════════════════════════════════════════════════════
 
-        # ── INTENT-BASED TIER ROUTING ──
-        # chat/question → TIER 1 (conversational brain)
-        # execute/monitor/control → TIER 2 (worker queue)
-        # grand tasks → TIER 3 (decompose + execute)
-
-        if _intent_type in ("chat", "question") and not _ollama_blacklist:
-            # TIER 1: Conversational — pick the right brain
-            _use_claude_direct = (
-                _intent_type == "question"  # questions need smarter brain
-                or len(text) < 10
-                or (_hist_ctx and len(_hist_ctx) > 30)
-                or _needs_realtime
-            )
-            if _use_claude_direct:
-                answer = _ask_claude(text, 45)
-                if answer:
-                    _add_to_history(chat_id, "assistant", answer[:500])
-                    _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
-                    return
-            # Chat → try Ollama first, fallback Claude CLI
-            answer = _ask_ollama(text)
-            # Hallucination guard: Ollama can't do real actions.
-            _is_bad_answer = not answer or (answer and any(x in answer for x in (
-                "不知道", "不确定", "需要查", "无法获取", "没有能力", "不能联网",
-                "需要通过", "无法回答", "没有信息", "无法确定", "抱歉",
-                "超出", "不了解", "没法", "做不到",
-                "can't", "don't know", "unable to", "not sure", "sorry",
-                "我会监控", "我会执行", "我会帮你", "我来帮你",
-                "已经开始", "正在执行", "正在监控", "正在分析",
-                "I'll monitor", "I will execute", "I'm now",
-                "等你的指令", "等你的消息", "等待指令", "等待你的",
-                "已就位", "准备就绪", "准备好了", "随时待命",
-                "收到，我是", "发消息过来", "发消息吧", "等你的指令",
-            )))
-            if _is_bad_answer:
-                _claude_answer = _ask_claude(text, 45)
-                if _claude_answer:
-                    answer = _claude_answer
+        if _intent_type in ("chat", "question"):
+            # ── CONVERSATIONAL: question/chat → Claude CLI understands + answers ──
+            _hint = f"{_intent_type}(conf={_intent.confidence:.2f}, {_intent.reasoning})"
+            answer = _ask_claude(text, 60, intent_hint=_hint)
+            if not answer:
+                # Claude CLI failed → degrade to Ollama
+                answer = _ask_ollama(text)
             if answer:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
-            # TIER 1 fallback: all brains failed — queue to worker instead of silent drop
+            # Both brains failed → queue to worker (don't drop silently)
             _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
             task_q.put((channel, chat_id, text, request_id))
             return
