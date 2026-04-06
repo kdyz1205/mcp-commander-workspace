@@ -318,6 +318,19 @@ def main() -> int:
     ensure_runtime_control(ws_path)
 
     _configure_telegram_http_runtime()
+
+    # ── Resource scan at startup — know what tools are available ──
+    try:
+        from claw_runtime.resource_registry import ResourceRegistry
+        _rr = ResourceRegistry(str(ws_path))
+        _rr.scan_all()
+        _scan = _rr.export_summary()
+        _cli_count = sum(1 for r in _scan.get("cli", []) if r.get("available"))
+        _model_count = sum(1 for r in _scan.get("models", []) if r.get("available"))
+        print(f"[ResourceRegistry] {_cli_count} CLI tools, {_model_count} models available")
+    except Exception as _rr_err:
+        print(f"[ResourceRegistry] scan skipped: {_rr_err}")
+
     bot = telebot.TeleBot(token, parse_mode=None)
     task_q: queue.Queue[tuple[str, int, str, str | None]] = queue.Queue()
     max_iters = int(os.environ.get("TG_DEVCLAW_MAX_ITERS", str(_DEFAULT_ITERS)))
@@ -866,9 +879,6 @@ def main() -> int:
             return None
 
         # ── INTENT CLASSIFICATION (fast regex, <1ms) ──
-        # Determines message TYPE, not which brain to use.
-        # Claude CLI is the DEFAULT brain for everything (subscription = already paid).
-        # Ollama is ONLY a degraded fallback when Claude CLI is down.
         try:
             from claw_runtime.intent_classifier import IntentClassifier
             _intent_clf = IntentClassifier()
@@ -885,6 +895,27 @@ def main() -> int:
             _intent = _FakeIntent()
 
         _intent_type = _intent.primary  # question|execute|hardwire|chat|monitor|control
+
+        # ── PROVIDER ROUTING (which brain?) ──
+        # Uses health state, budget, task type to pick provider
+        try:
+            from claw_runtime.provider_router import ProviderRouter
+            _provider_router = ProviderRouter(str(ws_path))
+            # Map intent to task type for provider router
+            _task_type_map = {
+                "chat": "chat", "question": "chat",
+                "execute": "engineering", "hardwire": "ops",
+                "monitor": "trading", "control": "ops",
+            }
+            _health = "HEALTHY"
+            try:
+                _sv_state, _ = SurvivalEngine(ws_path).assess_survival_state()
+                _health = _sv_state.name
+            except Exception:
+                pass
+            _provider = _provider_router.route_simple(text, health_state=_health)
+        except Exception:
+            _provider = None
 
         # ── HARDWIRE FAST PATH — bypass ALL LLMs, run Python directly ──
         # "跑策略" → run skill. "为什么要买入" → question (classifier suppresses hardwire).
@@ -949,31 +980,37 @@ def main() -> int:
             return
 
         # ══════════════════════════════════════════════════════════════
-        # CLAUDE-CLI-FIRST ROUTING
-        # Design: Claude CLI = default brain (subscription, already paid).
-        #         Ollama = degraded fallback ONLY when Claude CLI fails.
-        # Intent classifier decides WHAT to do, not WHICH brain.
+        # SMART ROUTING: Intent (what) × Provider Router (which brain)
+        # Intent classifier: regex <1ms → chat/question/execute/hardwire/monitor/control
+        # Provider router: health + budget + task type → ollama/claude_cli/openai_api
         # ══════════════════════════════════════════════════════════════
 
-        if _intent_type == "chat" and _intent.confidence >= 0.6:
-            # ── SIMPLE CHAT: "你好", "1", "哈哈", "ok" → Ollama fast (~0.3s) ──
-            answer = _ask_ollama(text)
-            if not answer:
-                answer = _ask_claude(text, 30)  # degrade up if Ollama fails
-            if answer:
-                _add_to_history(chat_id, "assistant", answer[:500])
-                _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
-                return
-            _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
-            task_q.put((channel, chat_id, text, request_id))
-            return
+        # Determine primary and fallback brains from provider router
+        _use_provider = (_provider.provider if _provider else "claude_cli")
+        _brain_map = {
+            "ollama": (_ask_ollama, _ask_claude),        # primary=ollama, fallback=claude
+            "claude_cli": (_ask_claude, _ask_ollama),    # primary=claude, fallback=ollama
+            "openai_api": (_ask_claude, _ask_ollama),    # openai goes through worker, for direct reply use claude
+            "offline": (_ask_ollama, None),              # offline = ollama only
+            "reject": (None, None),                      # don't run
+        }
+        _primary_brain, _fallback_brain = _brain_map.get(_use_provider, (_ask_claude, _ask_ollama))
 
-        elif _intent_type == "question" or (_intent_type == "chat" and _intent.confidence < 0.6):
-            # ── QUESTION / AMBIGUOUS: needs real understanding → Claude CLI ──
-            _hint = f"{_intent_type}(conf={_intent.confidence:.2f}, {_intent.reasoning})"
-            answer = _ask_claude(text, 60, intent_hint=_hint)
-            if not answer:
-                answer = _ask_ollama(text)  # degrade down if Claude fails
+        if _intent_type in ("chat", "question"):
+            # ── CONVERSATIONAL: pick brain based on provider router decision ──
+            _hint = f"{_intent_type}(conf={_intent.confidence:.2f}, provider={_use_provider})"
+            answer = None
+            if _primary_brain:
+                _timeout = int(getattr(_provider, 'timeout_sec', 60) if _provider else 60)
+                if _primary_brain == _ask_claude:
+                    answer = _primary_brain(text, _timeout, intent_hint=_hint)
+                else:
+                    answer = _primary_brain(text, min(_timeout, 30))
+            if not answer and _fallback_brain:
+                if _fallback_brain == _ask_claude:
+                    answer = _fallback_brain(text, 45, intent_hint=_hint)
+                else:
+                    answer = _fallback_brain(text)
             if answer:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
