@@ -915,7 +915,14 @@ def main() -> int:
         # ── TIER 0.5: HARDWIRED EXECUTOR — bypass LLM, execute Python directly ──
         # When user says "跑策略/扫描/回测/交易/模拟买入", don't ask LLM.
         # LLM will write an essay. Instead, import and run the skill.
-        _hardwire_kw = any(kw in text for kw in (
+        # GUARD: if the message is a QUESTION (contains 为什么/why/吗/怎么/什么/how),
+        # skip hardwire and let the LLM answer instead.
+        _is_question = any(q in text for q in (
+            "为什么", "为社么", "why", "吗", "怎么", "什么", "how", "what",
+            "是不是", "能不能", "可以吗", "对吗", "哪个", "几个", "多少",
+            "解释", "explain", "告诉我", "说说",
+        ))
+        _hardwire_kw = not _is_question and any(kw in text for kw in (
             "跑策略", "扫描", "回测", "套利", "执行策略", "开始赚钱",
             "跑各种", "模拟买", "模拟卖", "模拟交易", "paper trade",
             "run strategy", "run scan", "backtest", "start trading",
