@@ -397,6 +397,7 @@ def main() -> int:
 
                     _claude_done = False
                     _proc = None
+                    _sys_file_path = None
                     try:
                         import shutil as _wsh
                         _claude_bin = _wsh.which("claude") or "claude"
@@ -585,14 +586,22 @@ def main() -> int:
                                 return
                             _dispatch_reply(channel, chat_id, msg, request_id=request_id, kind="progress")
 
-                        dev_claw_run(
-                            instruction,
-                            max_iterations=max_iters,
-                            system_append=merged,
-                            progress_hook=hook,
-                        )
-                        _task_success = True
-                        _task_model = "dev_claw_run"
+                        try:
+                            dev_claw_run(
+                                instruction,
+                                max_iterations=max_iters,
+                                system_append=merged,
+                                progress_hook=hook,
+                            )
+                            _task_success = True
+                            _task_model = "dev_claw_run"
+                        except Exception as _dcr_err:
+                            _task_error = f"dev_claw_run fallback failed: {_dcr_err!s}"[:500]
+                            print(f"[Worker] dev_claw_run fallback error: {_dcr_err!s}", file=sys.stderr)
+                            _dispatch_reply(channel, chat_id,
+                                f"⚠️ 任务执行失败 (Claude CLI + 本地引擎均不可用)\n"
+                                f"错误: {_dcr_err!s}"[:1000],
+                                request_id=request_id, kind="error")
                     if channel == "local":
                         _dispatch_reply(
                             channel,
@@ -1244,10 +1253,10 @@ def main() -> int:
                 try:
                     from claw_runtime.consciousness_seed import consciousness_tick
                     consciousness_tick(ws_path)  # Silent, self-contained, debounced internally
-                except Exception:
-                    pass
-            except Exception:
-                pass
+                except Exception as _ct_err:
+                    print(f"[heartbeat] consciousness_tick error: {_ct_err!s}", file=sys.stderr)
+            except Exception as _hb_err:
+                print(f"[heartbeat] loop error: {_hb_err!s}", file=sys.stderr)
             time.sleep(max(15, tick))
 
     threading.Thread(target=survival_heartbeat_loop, daemon=True, name="survival-heartbeat").start()

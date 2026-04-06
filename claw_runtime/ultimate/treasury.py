@@ -15,7 +15,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
+try:
+    import numpy as np
+except ImportError:
+    np = None  # Graceful degradation — stats features disabled
 
 
 def probe_eth_balance(rpc_url: str, address: str) -> tuple[bool, str, int | None]:
@@ -120,6 +123,8 @@ def _load_public_market_snapshot(symbol: str) -> dict[str, Any]:
         return {"ok": False, "reason": str(exc)}
     if candles is None or len(candles) < 80:
         return {"ok": False, "reason": "insufficient candles"}
+    if np is None:
+        return {"ok": False, "reason": "numpy not installed — stats unavailable"}
     close = candles[:, 4]
     returns = np.diff(close) / close[:-1]
     momentum = float((close[-1] / close[-25] - 1.0) * 10_000) if len(close) >= 25 else 0.0
