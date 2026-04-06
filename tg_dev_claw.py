@@ -1224,6 +1224,17 @@ def main() -> int:
                     except Exception:
                         pass
 
+                # Capture git state BEFORE execution to verify claims
+                import subprocess as _idle_sp
+                _pre_diff = ""
+                try:
+                    _pre_diff = _idle_sp.run(
+                        ["git", "diff", "--stat"], capture_output=True,
+                        text=True, cwd=str(ws_path), timeout=10,
+                    ).stdout.strip()
+                except Exception:
+                    pass
+
                 merged = _merged_system_append(prompt) or system_append
                 dev_claw_run(
                     prompt,
@@ -1231,6 +1242,22 @@ def main() -> int:
                     system_append=merged,
                     progress_hook=_idle_hook,
                 )
+
+                # POST-EXECUTION VERIFICATION: did it actually change anything?
+                _post_diff = ""
+                try:
+                    _post_diff = _idle_sp.run(
+                        ["git", "diff", "--stat"], capture_output=True,
+                        text=True, cwd=str(ws_path), timeout=10,
+                    ).stdout.strip()
+                except Exception:
+                    pass
+                if _post_diff and _post_diff != _pre_diff:
+                    _send_chunks(bot, primary_chat,
+                        f"[空闲自检·验证] 实际文件变更:\n```\n{_post_diff[:2000]}\n```")
+                elif not _post_diff or _post_diff == _pre_diff:
+                    _send_chunks(bot, primary_chat,
+                        "[空闲自检·验证] 无实际文件变更（LLM声称的修复未落地）")
             except Exception as e:  # noqa: BLE001
                 try:
                     _broadcast_admins(f"[空闲自检异常] {e!s}"[:TG_CHUNK])
