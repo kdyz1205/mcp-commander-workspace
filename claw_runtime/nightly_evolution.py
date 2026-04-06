@@ -212,6 +212,10 @@ def maybe_promote_draft_skill(workspace: Path, draft_skill_dir: Path, *, gate_re
     return dest
 
 
+def _format_causes(causes: list[str]) -> str:
+    return "".join(f"- {c}\n" for c in causes)
+
+
 def _write_generated_skill_files(
     workspace: Path,
     skill_dir: Path,
@@ -247,7 +251,7 @@ def _write_generated_skill_files(
 
             ## Root Causes
 
-            {"".join(f"- {cause}\n" for cause in logic.root_causes)}
+            {_format_causes(logic.root_causes)}
 
             ## Rationale
 
