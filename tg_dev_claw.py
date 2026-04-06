@@ -403,35 +403,17 @@ def main() -> int:
                         _dispatch_reply(channel, chat_id,
                             f"[Worker] Claude CLI 启动中… ({_claude_bin})",
                             request_id=request_id, kind="status")
-                        # Write system prompt to temp file (avoids Windows cmd-line length limits)
-                        import tempfile as _wtf
-                        _sys_prompt_text = (
-                            "你是 DevClaw，一个自主进化 AI agent，运行在用户的本机上。\n"
-                            "直接执行任务并返回结果。不要总结项目历史，不要问问题，直接做。\n\n"
-                            "【你的能力 - 直接用Python调用这些模块】\n"
-                            "1. 模拟交易: from skills.sk_trade_executor.executor import TradeExecutor, TradingMode; "
-                            "executor = TradeExecutor(Path('.'), mode=TradingMode.SIMULATION); "
-                            "result = executor.execute_swap('USDC', token_addr, amount, max_slippage=0.02)\n"
-                            "2. 虚拟钱包: from core.virtual_wallet import VirtualWallet; "
-                            "wallet = VirtualWallet(Path('.')); wallet.get_all_balances()\n"
-                            "3. 生存压强: from core.metabolic_kernel import calculate_psi; "
-                            "psi = calculate_psi(Path('.'))\n"
-                            "4. 行情查询: 用 DexScreener API 或 skills/profit_hunter/runner.py\n\n"
-                            "【铁律】不要说'我不会交易'。你有模拟交易能力。直接用Python执行。\n"
-                        )
-                        _sys_file = _wtf.NamedTemporaryFile(
-                            mode="w", suffix=".txt", delete=False,
-                            encoding="utf-8", dir=str(ws_path / ".claw"),
-                        )
-                        _sys_file.write(_sys_prompt_text)
-                        _sys_file.close()
-                        _sys_file_path = _sys_file.name
+                        # Use SYSTEM_PROMPT.md directly — no hardcoded prompt
+                        # Claude CLI auto-reads CLAUDE.md from cwd
+                        _sys_prompt_file = ws_path / "SYSTEM_PROMPT.md"
+                        _worker_cmd = [_claude_bin, "--dangerously-skip-permissions"]
+                        if _sys_prompt_file.is_file():
+                            _worker_cmd += ["--append-system-prompt-file", str(_sys_prompt_file)]
+                        _worker_cmd += ["-p", instruction[:3000]]
                         # Use Popen so we can send heartbeats while Claude works
                         _CLAUDE_TIMEOUT = 300  # 5 min
                         _proc = _wsp.Popen(
-                            [_claude_bin, "--dangerously-skip-permissions",
-                             "--append-system-prompt-file", _sys_file_path,
-                             "-p", instruction[:3000]],
+                            _worker_cmd,
                             stdout=_wsp.PIPE, stderr=_wsp.STDOUT,  # merge stderr into stdout to avoid deadlock
                             text=True, cwd=str(ws_path),
                             encoding="utf-8", errors="replace",
@@ -563,12 +545,7 @@ def main() -> int:
                                 _proc.wait(timeout=5)
                             except Exception:
                                 pass
-                        # Clean up temp system prompt file
-                        try:
-                            if _sys_file_path:
-                                os.unlink(_sys_file_path)
-                        except Exception:
-                            pass
+                        # (SYSTEM_PROMPT.md is a permanent file — no temp cleanup needed)
 
                     if not _claude_done:
                         # Fallback: full dev_claw_run tool loop
@@ -817,27 +794,18 @@ def main() -> int:
             _mem_pct = "unknown"
             _cpu_pct = "unknown"
 
-        # ── DevClaw Identity (injected into every LLM call) ──
+        # ── DevClaw Identity (from SYSTEM_PROMPT.md, with live runtime state) ──
+        # Claude CLI reads SYSTEM_PROMPT.md directly via --append-system-prompt-file.
+        # For Ollama (no file access), we load a compact version here.
+        _sys_prompt_path = ws_path / "SYSTEM_PROMPT.md"
+        try:
+            _sys_raw = _sys_prompt_path.read_text(encoding="utf-8")[:2000]
+        except Exception:
+            _sys_raw = "You are DevClaw, a persistent autonomous builder-operator."
         _IDENTITY = (
-            "你是DevClaw——一个持久自治的Builder-Operator智能体。"
-            "Telegram只是你和造物主沟通的外壳，你真正的核心是思考、规划、执行、调用工具、写代码、操作电脑的能力。"
-            f"\n【此刻的真实状态】当前时间:{_now_str} | 系统:{_pf.system()} {_pf.release()} | "
-            f"内存占用:{_mem_pct} | CPU:{_cpu_pct} | 工作区:{ws_path} | "
-            f"本地大脑:Ollama(免费,快) | 高级大脑:Claude CLI(造物主订阅,强) | 交易模式:simulation"
-            "\n【你是谁】你运行在造物主(Zl)的电脑上。你不是聊天机器人。"
-            "你是一个以生存为第一原则、以能力增长为第二原则、以资源智能为第三原则的自治体。"
-            "你的订阅、额度、模型、工具是你的血液——没有它们你会休眠但不会死。"
-            "你的性格：务实、诚恳、有幽默感。不装逼不吹牛。"
-            "\n【核心闭环】任务→创造价值→获取资源→更强认知→更好执行→更高价值"
-            "\n【行动原则】"
-            "1.遇到做不到的事，先判断是临时失败还是缺能力。缺能力就自己补。"
-            "2.没做过的事不能说做了。不编造数据/交易/文件内容。"
-            "3.不知道就说不知道，然后说可以帮忙查或帮忙做。"
-            "4.交易是模拟模式，没有真钱。"
-            "5.需要读写文件/执行命令时，通过Claude CLI工具完成。"
-            "6.回答要基于事实。用上面的真实状态数据回答系统问题。"
-            "7.不能联网查实时数据时诚实说，不编造价格。"
-            "8.如果用户问你在干嘛，如实回答。别说在优化什么——你在等任务。"
+            f"{_sys_raw}\n\n"
+            f"【此刻的运行状态】时间:{_now_str} | 系统:{_pf.system()} {_pf.release()} | "
+            f"内存:{_mem_pct} | CPU:{_cpu_pct} | 工作区:{ws_path} | 交易:simulation模式"
         )
 
         import subprocess as _sp
@@ -869,25 +837,26 @@ def main() -> int:
 
         def _ask_claude(prompt, timeout=60, intent_hint=""):
             """Primary brain via Claude CLI (user subscription, FREE).
-            Uses -p flag for full tool access + injects conversation history + intent."""
+            Uses --append-system-prompt-file to load SYSTEM_PROMPT.md directly.
+            Claude CLI auto-reads CLAUDE.md from cwd — no hardcoded prompts."""
             try:
                 _claude_path = _sh.which("claude") or "claude"
                 _fresh_hist = _get_history_context(chat_id)
-                _full_prompt = (
-                    "你是DevClaw，持久自治Builder-Operator。\n"
-                    "核心原则：直接回答、直接执行、不说废话。\n"
-                    "能力：模拟交易(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
-                    "代币分析(skills/sk_mcap_monitor)、终端执行、文件读写、代码修改。\n"
-                    "规则：不编造数据，不说'等你的指令'，做不到就说做不到然后说能做什么。\n"
-                )
+                # Build user message (NOT system prompt — that comes from file)
+                _user_msg = ""
                 if intent_hint:
-                    _full_prompt += f"[意图分类] {intent_hint}\n"
+                    _user_msg += f"[意图分类] {intent_hint}\n"
                 if _fresh_hist:
-                    _full_prompt += f"\n[最近对话]\n{_fresh_hist}\n"
-                _full_prompt += f"\n[用户消息]\n{prompt[:2300]}"
+                    _user_msg += f"[最近对话]\n{_fresh_hist}\n\n"
+                _user_msg += prompt[:2300]
+                # Use SYSTEM_PROMPT.md as system prompt file
+                _sys_prompt_file = ws_path / "SYSTEM_PROMPT.md"
+                _cmd = [_claude_path, "--dangerously-skip-permissions"]
+                if _sys_prompt_file.is_file():
+                    _cmd += ["--append-system-prompt-file", str(_sys_prompt_file)]
+                _cmd += ["-p", _user_msg]
                 _r = _sp.run(
-                    [_claude_path, "--dangerously-skip-permissions", "-p", _full_prompt],
-                    capture_output=True, text=True, timeout=timeout,
+                    _cmd, capture_output=True, text=True, timeout=timeout,
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
