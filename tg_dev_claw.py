@@ -1026,6 +1026,10 @@ def main() -> int:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
+            # TIER 1 fallback: all brains failed — queue to worker instead of silent drop
+            _dispatch_reply(channel, chat_id, "处理中…", request_id=request_id)
+            task_q.put((channel, chat_id, text, request_id))
+            return
 
         elif _is_task and (not assessment or not assessment.should_decompose):
             # TIER 2: Medium tasks
