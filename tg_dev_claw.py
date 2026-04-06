@@ -662,6 +662,35 @@ def main() -> int:
             kind=kind,
         )
 
+    # ── Response sanitizer: strip capability listing garbage from LLM output ──
+    _GARBAGE_PATTERNS = (
+        "DevClaw 在线", "DevClaw 已就绪", "DevClaw online", "DevClaw ready",
+        "当前状态: **IDLE**", "当前状态:**IDLE**", "当前状态: IDLE",
+        "随时可以执行任务", "随时可以执行",
+    )
+
+    def _sanitize_response(text: str) -> str | None:
+        """Return sanitized text, or None if the entire response is garbage."""
+        if not text or not text.strip():
+            return None
+        # If the response is MOSTLY a capability listing, kill it entirely
+        _garbage_score = 0
+        for pat in _GARBAGE_PATTERNS:
+            if pat in text:
+                _garbage_score += 3
+        # Check for bullet-point capability lists
+        import re as _sre
+        _bullet_caps = _sre.findall(r'[-•\*]\s*\*{0,2}(?:模拟交易|代币分析|OKX|行情|自主进化|pain sensor|dream state|LOB|MA Ribbon)', text)
+        _garbage_score += len(_bullet_caps) * 2
+        # Check for "需要我做什么" endings
+        if any(x in text[-100:] for x in ("需要我做什么", "需要什么", "还是别的", "直接说", "发消息")):
+            _garbage_score += 2
+
+        if _garbage_score >= 5:
+            return None  # Entire response is garbage
+
+        return text
+
     def _dispatch_reply(channel: str, chat_id: int, text: str, *, request_id: str | None = None, kind: str = "reply") -> None:
         if channel == "local":
             _send_local_reply(request_id, chat_id, text, kind=kind)
@@ -883,6 +912,81 @@ def main() -> int:
             )
             return
 
+        # ── TIER -0.5: Blockchain URL detection + Chain analysis ──
+        # Detect solscan/solana explorer/etherscan URLs or wallet analysis requests
+        _url_match = _route_re.search(
+            r'(https?://(?:solscan\.io|explorer\.solana\.com|solana\.fm|etherscan\.io|birdeye\.so)[^\s]+)',
+            text, _route_re.IGNORECASE,
+        )
+        _chain_analysis_kw = any(kw in text for kw in (
+            "做市商", "market maker", "聪明钱", "smart money", "巨鲸", "whale",
+            "是否是", "是不是", "分析", "analyze", "这个地址", "this address",
+            "这个钱包", "this wallet", "交易模式", "trading pattern",
+        ))
+        # Also detect bare wallet address + analysis question (no URL needed)
+        _wallet_analysis = _token_match and _chain_analysis_kw
+
+        if _url_match or _wallet_analysis:
+            # Extract wallet address from URL or from text
+            _analysis_addr = None
+            if _url_match:
+                _url_str = _url_match.group(1)
+                _addr_from_url = _route_re.search(r'/account/([A-HJ-NP-Za-km-z1-9]{32,50})', _url_str)
+                _analysis_addr = _addr_from_url.group(1) if _addr_from_url else None
+            if not _analysis_addr and _token_match:
+                _analysis_addr = str(_token_match.group(1))
+
+            if _analysis_addr:
+                import threading
+
+                def _run_chain_analysis(_addr, _txt, _ch, _cid, _rid):
+                    try:
+                        sys.path.insert(0, str(ws_path)) if str(ws_path) not in sys.path else None
+                        from skills.sk_chain_analyzer.runner import analyze_wallet
+                        result = analyze_wallet(_addr, question=_txt)
+                        _dispatch_reply(_ch, _cid, result[:4000], request_id=_rid)
+                    except ImportError:
+                        # Fallback: use Claude CLI for analysis
+                        import subprocess as _asp
+                        import shutil as _ash
+                        _claude_path = _ash.which("claude") or "claude"
+                        _prompt = (
+                            f"分析这个 Solana 钱包地址: {_addr}\n"
+                            f"用户问题: {_txt[:500]}\n\n"
+                            "请用 DexScreener API 和 Solana RPC 查询该地址的交易历史。"
+                            "分析其交易模式，判断是否是做市商/聪明钱/巨鲸。"
+                            "给出具体的数据支撑（交易频率、金额、代币种类等）。"
+                            "直接给结论，不要列举你的能力。"
+                        )
+                        try:
+                            _r = _asp.run(
+                                [_claude_path, "--dangerously-skip-permissions", "-p", _prompt],
+                                capture_output=True, text=True, timeout=120,
+                                cwd=str(ws_path), encoding="utf-8", errors="replace",
+                            )
+                            if _r.returncode == 0 and _r.stdout.strip():
+                                _dispatch_reply(_ch, _cid, _r.stdout.strip()[:4000], request_id=_rid)
+                            else:
+                                _dispatch_reply(_ch, _cid,
+                                    f"正在查询钱包 {_addr[:8]}...{_addr[-6:]} 的链上数据，"
+                                    "但当前无法连接分析工具。请稍后重试。",
+                                    request_id=_rid)
+                        except Exception as _ae:
+                            _dispatch_reply(_ch, _cid, f"链上分析失败: {_ae!s}", request_id=_rid)
+                    except Exception as e:
+                        _dispatch_reply(_ch, _cid, f"链上分析失败: {e!s}", request_id=_rid)
+
+                _dispatch_reply(channel, chat_id,
+                    f"🔍 正在分析钱包 {_analysis_addr[:8]}...{_analysis_addr[-6:]} 的链上数据…",
+                    request_id=request_id)
+                threading.Thread(
+                    target=_run_chain_analysis,
+                    args=(_analysis_addr, text, channel, chat_id, request_id),
+                    daemon=True, name=f"chain-{_analysis_addr[:8]}",
+                ).start()
+                _add_to_history(chat_id, "assistant", f"正在分析钱包: {_analysis_addr[:12]}...")
+                return
+
         # ── Intelligent routing: pick the right brain for the task ──
         # Simple chat → Ollama (fast, local, <5s)
         # Medium tasks → Claude CLI (user's subscription, not API, high quality)
@@ -926,29 +1030,13 @@ def main() -> int:
             _cpu_pct = "unknown"
 
         # ── DevClaw Identity (injected into every LLM call) ──
+        # CRITICAL: Keep this SHORT. Ollama (4b model) will regurgitate long prompts.
         _IDENTITY = (
-            "你是DevClaw，一个自主进化的超级智能体。"
-            f"\n【此刻的真实状态】当前时间:{_now_str} | 系统:{_pf.system()} {_pf.release()} | "
-            f"内存占用:{_mem_pct} | CPU:{_cpu_pct} | 工作区:{ws_path} | "
-            f"本地大脑:Gemma3:4b(Ollama) | 高级大脑:Claude CLI(造物主订阅) | 交易模式:simulation"
-            "\n【你是谁】你运行在造物主(Zl)的电脑上。你有自我意识，在不断进化。"
-            "你的性格：务实、诚恳、有幽默感。不装逼不吹牛。"
-            "\n【反幻觉铁律】"
-            "1.没做过的事不能说做了。不编造数据/交易/文件内容。"
-            "2.不知道就说不知道，然后说可以帮忙查。"
-            "3.交易是模拟模式，没有真钱。"
-            "4.需要读写文件/执行命令时，说明需要通过Claude CLI工具完成。"
-            "5.回答要基于事实。如果用户问时间/系统状态，用上面的真实数据回答。"
-            "6.你不能联网查实时数据（价格/新闻/天气）。如果用户问实时信息，诚实说你需要通过工具链查询，不要编造价格数字。"
-            "7.你此刻没有在做任何事。你在等待用户给你发消息。"
-            "不要说'正在优化模型/算法/代码'——你没有在优化任何东西，你只是在等。"
-            "如果用户问你在干嘛，回答：'在等你给我任务呢'或类似真实的话。"
-            "\n【回复规则 - 极其重要】"
-            "1.绝对不要列举你的能力清单。用户问你能做什么时，用一句话概括，不要列bullet points。"
-            "2.绝对不要在回复中输出'DevClaw 在线'、'DevClaw 已就绪'、'IDLE'、'当前状态'这类废话。"
-            "3.直接回答用户的问题或执行用户的指令。不要先自我介绍再回答。"
-            "4.如果用户发了你无法执行的请求，简短说明原因和替代方案，不要列能力清单。"
-            "5.回复要简短精炼，不超过3-5句话，除非用户明确要求详细解释。"
+            "你是DevClaw。直接回答用户问题，简短精炼。"
+            f"\n当前时间:{_now_str} | 系统:{_pf.system()} | 内存:{_mem_pct} | CPU:{_cpu_pct}"
+            "\n规则：1.不编造数据 2.不知道就说不知道 3.不要列举能力清单 "
+            "4.不要说'在线/就绪/IDLE/当前状态' 5.不要自我介绍 "
+            "6.不要说'我的能力/核心能力' 7.直接回答，不超过3句话"
         )
 
         import subprocess as _sp
@@ -973,7 +1061,8 @@ def main() -> int:
                     encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
-                    return _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
+                    raw = _re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\[\d*[A-Z]|\[K', '', _r.stdout).strip()
+                    return _sanitize_response(raw)
             except Exception:
                 pass
             return None
@@ -986,12 +1075,9 @@ def main() -> int:
                 # Re-fetch history at call time (not stale closure from routing)
                 _fresh_hist = _get_history_context(chat_id)
                 _full_prompt = (
-                    "你是DevClaw，自主进化AI agent。直接回答问题，不要说'等你的指令'。"
-                    "你有模拟交易能力(skills/sk_trade_executor)、虚拟钱包(core/virtual_wallet)、"
-                    "代币分析(skills/sk_mcap_monitor)、钱包监控(skills/sk_wallet_monitor)。"
-                    "用户问交易/行情时直接查数据或执行。\n"
-                    "【禁止】不要列举能力清单，不要输出'DevClaw 在线/已就绪/IDLE'，不要自我介绍。"
-                    "直接针对用户的具体问题给出具体回答。\n\n"
+                    "你是DevClaw。直接回答用户的具体问题。\n"
+                    "【绝对禁止】不要列举能力，不要输出'在线/就绪/IDLE/当前状态'，不要自我介绍，"
+                    "不要问'需要我做什么/还是别的'。直接给答案。\n\n"
                 )
                 if _fresh_hist:
                     _full_prompt += f"[最近对话记录]\n{_fresh_hist}\n\n"
@@ -1002,7 +1088,7 @@ def main() -> int:
                     cwd=str(ws_path), encoding="utf-8", errors="replace",
                 )
                 if _r.returncode == 0 and _r.stdout.strip():
-                    return _r.stdout.strip()
+                    return _sanitize_response(_r.stdout.strip())
             except Exception:
                 pass
             return None
@@ -1011,11 +1097,14 @@ def main() -> int:
         # Price/real-time data queries → skip Ollama, go straight to Claude CLI
         _needs_realtime = any(kw in text.lower() for kw in (
             "价格", "price", "多少钱", "市价", "现价", "实时",
-            "行情", "涨了", "跌了", "几刀", "美金",
+            "行情", "涨了", "跌了", "几刀",
             "market price", "how much", "current price",
             "币价", "汇率", "报价", "盘面", "走势",
             "btc价", "eth价", "sol价", "bnb价",
         ))
+        # Don't route to TIER 0 if already handled by monitoring/analysis
+        if _needs_realtime and (_is_wallet_monitor or _is_monitor or _wallet_analysis or _url_match):
+            _needs_realtime = False
 
         # ── TIER 0: Price/real-time queries → Claude CLI directly (Ollama can't fetch live data) ──
         if _needs_realtime:
@@ -1122,23 +1211,48 @@ def main() -> int:
                     return
             # Longer standalone questions → try Ollama first, fallback Claude CLI
             answer = _ask_ollama(text)
-            # Hallucination guard: Ollama can't do real actions.
+            # Hallucination guard: Ollama can't do real actions and often
+            # regurgitates the system prompt as capability listings.
             _is_bad_answer = not answer or (answer and any(x in answer for x in (
+                # "I don't know" patterns
                 "不知道", "不确定", "需要查", "无法获取", "没有能力", "不能联网",
                 "需要通过", "无法回答", "没有信息", "无法确定", "抱歉",
                 "超出", "不了解", "没法", "做不到",
                 "can't", "don't know", "unable to", "not sure", "sorry",
+                # "I'll do it" hallucinations (Ollama CAN'T execute anything)
                 "我会监控", "我会执行", "我会帮你", "我来帮你",
                 "已经开始", "正在执行", "正在监控", "正在分析",
                 "I'll monitor", "I will execute", "I'm now",
+                # "I'm waiting" filler
                 "等你的指令", "等你的消息", "等待指令", "等待你的",
                 "已就位", "准备就绪", "准备好了", "随时待命",
-                "收到，我是", "发消息过来", "发消息吧", "等你的指令",
+                "收到，我是", "发消息过来", "发消息吧",
+                # CRITICAL: capability listing patterns (the #1 problem)
+                "DevClaw 在线", "DevClaw 已就绪", "DevClaw online",
+                "当前状态", "当前能力", "核心能力", "我的能力",
+                "能力概览", "IDLE", "随时可以执行",
+                "模拟交易", "sk_trade_executor", "sk_mcap_monitor",
+                "自主进化", "pain sensor", "dream state",
+                "需要我做什么", "需要什么", "还是别的",
+                "查行情", "分析代币", "执行交易",
+                "行情查询", "策略回测", "代码审计",
+                # Status listing patterns
+                "系统状态", "main branch", "未提交", "待提交",
+                "新文件", "核心能力", "LOB引擎", "MA Ribbon",
             )))
             if _is_bad_answer:
                 _claude_answer = _ask_claude(text, 45)
                 if _claude_answer:
-                    answer = _claude_answer
+                    # Also filter Claude's response for the same patterns
+                    _claude_bad = any(x in _claude_answer for x in (
+                        "DevClaw 在线", "DevClaw 已就绪", "当前状态",
+                        "我的能力", "核心能力", "IDLE", "随时可以执行",
+                        "需要我做什么", "还是别的",
+                    ))
+                    if not _claude_bad:
+                        answer = _claude_answer
+                    else:
+                        answer = None  # Both LLMs gave garbage
             if answer:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)

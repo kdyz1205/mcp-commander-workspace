@@ -91,6 +91,13 @@
       "path": "skills/sk_wallet_monitor/runner.py",
       "invoke": "py skills/sk_wallet_monitor/runner.py <wallet_address> <token_symbol> <min_usd>",
       "notes": "监控指定钱包的链上交易。支持 Helius API (需 HELIUS_API_KEY) 或基础 Solana RPC。每30秒轮询，买入超阈值时 TG 推送。"
+    },
+    {
+      "id": "sk_chain_analyzer",
+      "title": "链上钱包分析（做市商/巨鲸/聪明钱识别）",
+      "path": "skills/sk_chain_analyzer/runner.py",
+      "invoke": "py skills/sk_chain_analyzer/runner.py <wallet_address>",
+      "notes": "分析 Solana 钱包交易模式，判断是否为做市商/巨鲸/聪明钱。支持 Solscan URL 自动解析。使用 Helius + DexScreener + Solana RPC。"
     }
   ]
 }
