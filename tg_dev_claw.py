@@ -627,6 +627,7 @@ def main() -> int:
                     _dispatch_reply(channel, chat_id, err, request_id=request_id, kind="error")
                 finally:
                     # ── Record action outcome for self-intelligence learning ──
+                    _task_duration = time.time() - _task_t0
                     try:
                         from claw_runtime.self_intelligence import ActionOutcome, record_action
                         record_action(ws_path, ActionOutcome(
@@ -636,11 +637,29 @@ def main() -> int:
                             instruction_summary=instruction[:200],
                             success=_task_success,
                             tokens_used=len(instruction) // 4,
-                            time_sec=time.time() - _task_t0,
+                            time_sec=_task_duration,
                             error=_task_error,
                             quality_score=0.8 if _task_success else 0.1,
                             model_used=_task_model,
                         ))
+                    except Exception:
+                        pass
+                    # ── Budget tracking: record API spend ──
+                    try:
+                        from claw_runtime.budget_manager import BudgetManager
+                        _bm = BudgetManager(str(ws_path))
+                        # Estimate cost: claude_cli is free (subscription),
+                        # dev_claw_run uses OpenAI API (paid)
+                        if _task_model == "dev_claw_run":
+                            _est_tokens = len(instruction) // 4
+                            _est_cost = _est_tokens * 0.000003  # ~$3/1M input tokens
+                            _bm.record_spend(
+                                amount_usd=_est_cost,
+                                category="task",
+                                task_id=request_id or "",
+                                model="gpt-4o",
+                                tokens_in=_est_tokens,
+                            )
                     except Exception:
                         pass
                     _configure_telegram_http_runtime()
@@ -928,22 +947,41 @@ def main() -> int:
 
         # ── PROVIDER ROUTING (which brain?) ──
         # Uses health state, budget, task type to pick provider
+        _health = "HEALTHY"
+        _budget_remaining = 8.0
         try:
-            from claw_runtime.provider_router import ProviderRouter
+            _sv_state, _ = SurvivalEngine(ws_path).assess_survival_state()
+            _health = _sv_state.name
+        except Exception:
+            pass
+        try:
+            from claw_runtime.budget_manager import BudgetManager
+            _bm = BudgetManager(str(ws_path))
+            _bs = _bm.status()
+            _budget_remaining = _bs.daily_remaining_usd
+        except Exception:
+            pass
+
+        try:
+            from claw_runtime.provider_router import ProviderRouter, RoutingContext
             _provider_router = ProviderRouter(str(ws_path))
-            # Map intent to task type for provider router
             _task_type_map = {
                 "chat": "chat", "question": "chat",
                 "execute": "engineering", "hardwire": "ops",
                 "monitor": "trading", "control": "ops",
             }
-            _health = "HEALTHY"
-            try:
-                _sv_state, _ = SurvivalEngine(ws_path).assess_survival_state()
-                _health = _sv_state.name
-            except Exception:
-                pass
-            _provider = _provider_router.route_simple(text, health_state=_health)
+            _ctx = RoutingContext(
+                task_type=_task_type_map.get(_intent_type, "chat"),
+                complexity_score=assessment.score if assessment else 3,
+                health_state=_health,
+                budget_remaining_daily_usd=_budget_remaining,
+                is_evolution_window=False,
+                requires_tools=_intent_type in ("execute", "monitor", "control"),
+                requires_realtime=any(kw in text.lower() for kw in ("价格", "price", "行情", "market")),
+                message_length=len(text),
+                priority=5,
+            )
+            _provider = _provider_router.route(_ctx)
         except Exception:
             _provider = None
 
@@ -1238,6 +1276,23 @@ def main() -> int:
                 try:
                     if task_q.unfinished_tasks > 0 or task_q.qsize() > 0:
                         continue
+                except Exception:
+                    pass
+
+                # ── Evolution Scheduler: deterministic failure→skill pipeline ──
+                try:
+                    from claw_runtime.evolution_scheduler import EvolutionScheduler
+                    _evo = EvolutionScheduler(str(ws_path))
+                    _evo_ok, _evo_reason = _evo.can_evolve()
+                    if _evo_ok:
+                        _evo_results = _evo.run_evolution_cycle()
+                        if _evo_results:
+                            _evo_summary = "\n".join(
+                                f"  • {r.candidate_id}: {r.status} ({r.lesson[:80]})"
+                                for r in _evo_results
+                            )
+                            _send_chunks(bot, primary_chat,
+                                f"[进化调度] {len(_evo_results)} 个候选:\n{_evo_summary}")
                 except Exception:
                     pass
 

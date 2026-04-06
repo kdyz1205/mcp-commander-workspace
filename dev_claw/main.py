@@ -211,7 +211,8 @@ def execute_terminal(command: str) -> str:
 
 
 def edit_local_file(filepath: str, content: str, mode: str = "w") -> str:
-    """Read or write text under workspace (paths outside workspace are rejected)."""
+    """Read or write text under workspace (paths outside workspace are rejected).
+    Protected files are blocked by PromotionGate."""
     root = os.path.abspath(_workspace_root())
     print(f"\n[file] {mode} {filepath}")
     abs_path = os.path.abspath(os.path.join(root, filepath))
@@ -223,6 +224,19 @@ def edit_local_file(filepath: str, content: str, mode: str = "w") -> str:
             with open(abs_path, encoding="utf-8") as f:
                 data = f.read()
             return data[:MAX_TOOL_CHARS]
+
+        # ── Promotion Gate: block writes to protected paths ──
+        try:
+            from claw_runtime.promotion_gate import PromotionGate
+            _gate = PromotionGate(root)
+            _scope_ok, _scope_reason = _gate.check_scope([filepath])
+            if not _scope_ok:
+                return f"[PromotionGate] 写入被拒绝: {_scope_reason}"
+            _protected_ok, _protected_reason = _gate.check_no_protected([filepath])
+            if not _protected_ok:
+                return f"[PromotionGate] 受保护文件，需人工审批: {_protected_reason}"
+        except Exception:
+            pass  # gate import failure should not block writes
 
         parent = os.path.dirname(abs_path)
         if parent:
