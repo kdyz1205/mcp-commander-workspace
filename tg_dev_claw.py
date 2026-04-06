@@ -1177,7 +1177,7 @@ def main() -> int:
     threading.Thread(target=local_operator_loop, daemon=True, name="operator-bridge").start()
 
     def idle_autotick_loop() -> None:
-        """空闲时每 30 分钟（可配置）跑一次梦境自审计 + 自检 DevClaw。"""
+        """空闲时每 30 分钟（可配置）跑一次自审计 + 自检 DevClaw。"""
         if not _env_truthy("TG_IDLE_AUTOTICK"):
             return
         ws_path = Path(os.environ.get("DEVCLAW_WORKSPACE", _REPO_ROOT)).resolve()
@@ -1205,13 +1205,13 @@ def main() -> int:
                 except Exception:
                     pass
 
-                # ── Dream State: audit logs → inject fix tasks → generate smart prompt ──
+                # ── Idle Audit: scan logs → inject fix tasks → generate prompt ──
                 try:
                     from claw_runtime.dream_state import inject_dream_tasks, generate_dream_prompt
                     dream_tasks = inject_dream_tasks(ws_path)
                     if dream_tasks:
                         _send_chunks(bot, primary_chat,
-                            f"💤 梦境审计完成 — 发现 {len(dream_tasks)} 个问题，已写入进化队列：\n"
+                            f"[空闲自检] 发现 {len(dream_tasks)} 个待修复项，已写入进化队列：\n"
                             + "\n".join(f"  • {t[:80]}" for t in dream_tasks[:5])
                         )
                     prompt = generate_dream_prompt(ws_path)
@@ -1220,7 +1220,7 @@ def main() -> int:
 
                 def _idle_hook(msg: str) -> None:
                     try:
-                        _send_chunks(bot, primary_chat, f"[💤 梦境模式]\n{msg}")
+                        _send_chunks(bot, primary_chat, f"[空闲自检]\n{msg}")
                     except Exception:
                         pass
 
@@ -1233,7 +1233,7 @@ def main() -> int:
                 )
             except Exception as e:  # noqa: BLE001
                 try:
-                    _broadcast_admins(f"[梦境异常] {e!s}"[:TG_CHUNK])
+                    _broadcast_admins(f"[空闲自检异常] {e!s}"[:TG_CHUNK])
                 except Exception:
                     pass
 
