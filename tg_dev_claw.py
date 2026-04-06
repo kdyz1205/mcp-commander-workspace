@@ -893,8 +893,30 @@ def main() -> int:
                 pass
             return None
 
-        # ── THREE-TIER ROUTING ──
-        # Price/real-time data queries → skip Ollama, go straight to Claude CLI
+        # ── INTENT-BASED ROUTING ──
+        # Uses scoring-based IntentClassifier: regex fast path + optional LLM fallback
+        try:
+            from claw_runtime.intent_classifier import IntentClassifier
+            _intent_clf = IntentClassifier()
+            # Build a lightweight LLM function for ambiguous cases
+            def _llm_classify(prompt):
+                return _ask_ollama(prompt, timeout=10)
+            _intent = _intent_clf.classify_with_llm_fallback(text, llm_fn=_llm_classify)
+        except Exception:
+            # Fallback: treat as chat if classifier import fails
+            from dataclasses import dataclass as _dc, field as _fld
+            @_dc
+            class _FakeIntent:
+                primary: str = "chat"
+                confidence: float = 0.5
+                scores: dict = _fld(default_factory=dict)
+                matched_keywords: list = _fld(default_factory=list)
+                reasoning: str = "classifier_unavailable"
+            _intent = _FakeIntent()
+
+        _intent_type = _intent.primary  # question|execute|hardwire|chat|monitor|control
+
+        # Price/real-time data queries → Claude CLI directly (Ollama can't fetch live data)
         _needs_realtime = any(kw in text.lower() for kw in (
             "价格", "price", "多少钱", "市价", "现价", "实时",
             "行情", "涨了", "跌了", "几刀", "美金",
@@ -903,28 +925,18 @@ def main() -> int:
             "btc价", "eth价", "sol价", "bnb价",
         ))
 
-        # ── TIER 0: Price/real-time queries → Claude CLI directly (Ollama can't fetch live data) ──
+        # ── TIER 0: Price/real-time queries → Claude CLI directly ──
         if _needs_realtime:
             answer = _ask_claude(text, 60)
             if answer:
                 _add_to_history(chat_id, "assistant", answer[:500])
                 _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                 return
-            # If Claude CLI also fails, fall through to worker queue
 
         # ── TIER 0.5: HARDWIRED EXECUTOR — bypass LLM, execute Python directly ──
-        # When user says "跑策略/扫描/回测/交易/模拟买入", don't ask LLM.
-        # LLM will write an essay. Instead, import and run the skill.
-        _hardwire_kw = any(kw in text for kw in (
-            "跑策略", "扫描", "回测", "套利", "执行策略", "开始赚钱",
-            "跑各种", "模拟买", "模拟卖", "模拟交易", "paper trade",
-            "run strategy", "run scan", "backtest", "start trading",
-            "profit hunt", "funding rate", "资金费率",
-            "修复bug", "修复", "fix bug", "自我修复", "自愈",
-            "钱包状态", "持仓", "portfolio", "余额",
-            "生存状态", "vitals", "psi", "压强",
-        ))
-        if _hardwire_kw:
+        # IntentClassifier already handles question suppression:
+        # "为什么要买入" → question (not hardwire), "跑策略" → hardwire
+        if _intent_type == "hardwire":
             _dispatch_reply(channel, chat_id, "⚡ 硬接线执行中（绕过LLM，直接跑Python脚本）…", request_id=request_id)
             _hw_results = []
             # 1. Profit Hunter scan
@@ -988,17 +1000,20 @@ def main() -> int:
         # Token addresses, monitoring requests, anything with crypto addresses
         # These cause Ollama to hallucinate "ok I'll monitor" without doing anything.
         _has_token_addr = _token_match is not None
-        _ollama_blacklist = _has_token_addr or any(
-            kw in text for kw in ("监控", "突破", "alert", "watch", "repeat", "bug", "修复")
-        )
+        _ollama_blacklist = _has_token_addr or _intent_type in ("monitor", "execute", "control")
 
-        if _is_short and not _is_task and not _ollama_blacklist:
-            # TIER 1: Simple chat
-            # Short messages (<10 chars) or messages with history context → Claude CLI
-            # (Ollama can't handle follow-ups or ultra-short messages meaningfully)
+        # ── INTENT-BASED TIER ROUTING ──
+        # chat/question → TIER 1 (conversational brain)
+        # execute/monitor/control → TIER 2 (worker queue)
+        # grand tasks → TIER 3 (decompose + execute)
+
+        if _intent_type in ("chat", "question") and not _ollama_blacklist:
+            # TIER 1: Conversational — pick the right brain
             _use_claude_direct = (
-                len(text) < 10
+                _intent_type == "question"  # questions need smarter brain
+                or len(text) < 10
                 or (_hist_ctx and len(_hist_ctx) > 30)
+                or _needs_realtime
             )
             if _use_claude_direct:
                 answer = _ask_claude(text, 45)
@@ -1006,7 +1021,7 @@ def main() -> int:
                     _add_to_history(chat_id, "assistant", answer[:500])
                     _dispatch_reply(channel, chat_id, answer[:4000], request_id=request_id)
                     return
-            # Longer standalone questions → try Ollama first, fallback Claude CLI
+            # Chat → try Ollama first, fallback Claude CLI
             answer = _ask_ollama(text)
             # Hallucination guard: Ollama can't do real actions.
             _is_bad_answer = not answer or (answer and any(x in answer for x in (
@@ -1034,7 +1049,7 @@ def main() -> int:
             task_q.put((channel, chat_id, text, request_id))
             return
 
-        elif _is_task and (not assessment or not assessment.should_decompose):
+        elif _intent_type in ("execute", "monitor", "control") and (not assessment or not assessment.should_decompose):
             # TIER 2: Medium tasks
             # If it needs ACTUAL file/code operations → full tool loop (can use tools)
             _needs_tools = any(kw in text.lower() for kw in (
